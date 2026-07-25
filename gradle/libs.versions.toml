@@ -1,0 +1,79 @@
+# Version Catalog for iMirror
+# Centralizes all dependency versions so they are easy to update in one place.
+# Reference: https://docs.gradle.org/current/userguide/platforms.html
+
+[versions]
+# Build tools
+agp = "8.6.1"                          # Android Gradle Plugin
+kotlin = "1.9.23"                      # Kotlin compiler
+desugar-jdk-libs = "2.0.4"            # Core library desugaring (backports Java 8+ APIs to API 25)
+
+# AndroidX
+appcompat = "1.7.0"
+constraintlayout = "2.1.4"
+core-ktx = "1.13.1"
+leanback = "1.2.0"                     # TV navigation, focus management, on-screen keyboard
+
+# Kotlin Coroutines — for all async I/O (network, media)
+coroutines = "1.8.1"
+
+# DataStore — typed key-value persistence replacing SharedPreferences
+datastore = "1.1.1"
+
+# Logging — Timber provides tagged, filterable logs
+timber = "5.0.1"
+
+# Cryptography — Bouncy Castle provides AES-128-CTR and SRP-6a
+# (Android's built-in javax.crypto lacks full SRP support)
+bouncycastle = "1.78.1"
+play-services-cast-tv = "20.0.0"
+
+# Binary property lists — Apple's bplist format used across the AirPlay 2 handshake
+# (GET /info, SETUP) for encoding/decoding NSDictionary-style payloads.
+ddplist = "1.28"
+
+# Testing
+junit = "4.13.2"
+mockk = "1.13.10"
+robolectric = "4.14.1"
+androidx-test-ext = "1.1.5"
+espresso = "3.5.1"
+
+[libraries]
+# AndroidX
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+androidx-constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout", version.ref = "constraintlayout" }
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "core-ktx" }
+androidx-leanback = { group = "androidx.leanback", name = "leanback", version.ref = "leanback" }
+
+# DataStore — async, type-safe settings persistence
+androidx-datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
+
+# Kotlin Coroutines
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
+
+# Logging
+timber = { group = "com.jakewharton.timber", name = "timber", version.ref = "timber" }
+
+# Core library desugaring
+desugar-jdk-libs = { group = "com.android.tools", name = "desugar_jdk_libs", version.ref = "desugar-jdk-libs" }
+
+# Cryptography
+bouncycastle = { group = "org.bouncycastle", name = "bcprov-jdk18on", version.ref = "bouncycastle" }
+play-services-cast-tv = { group = "com.google.android.gms", name = "play-services-cast-tv", version.ref = "play-services-cast-tv" }
+
+# Binary property list parser/writer (pure Java)
+ddplist = { group = "com.googlecode.plist", name = "dd-plist", version.ref = "ddplist" }
+
+# Testing
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+mockk = { group = "io.mockk", name = "mockk", version.ref = "mockk" }
+robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
+androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidx-test-ext" }
+espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espresso" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

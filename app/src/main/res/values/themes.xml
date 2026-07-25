@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Base theme — dark TV theme based on Google TV Streamer design language.
+        - True black background for OLED-friendly displays
+        - Accent blue for focus and active states
+        - Leanback parent for D-pad / TV launcher compatibility
+    -->
+    <style name="Theme.IMirror" parent="@style/Theme.AppCompat.Leanback">
+        <item name="android:windowBackground">@color/background_dark</item>
+        <item name="android:colorPrimary">@color/accent_blue</item>
+        <item name="android:colorPrimaryDark">@color/background_dark</item>
+        <item name="android:colorAccent">@color/accent_blue</item>
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+        <item name="android:statusBarColor">@color/background_dark</item>
+        <item name="android:navigationBarColor">@color/background_dark</item>
+    </style>
+
+    <!-- Fullscreen theme: hides status bar for StreamingScreen -->
+    <style name="Theme.IMirror.Fullscreen" parent="Theme.IMirror">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+</resources>

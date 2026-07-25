@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    AndroidManifest.xml for iMirror.
+
+    Permission philosophy: request ONLY what is strictly necessary.
+    See docs/spec/REQUIREMENTS.md §2.3 for the full permission rationale.
+
+    INTERNET                    — required for local TCP/UDP socket operations (AirPlay is LAN-only)
+    CHANGE_WIFI_MULTICAST_STATE — required to join mDNS multicast groups
+    ACCESS_WIFI_STATE           — required to read the device's IP address and MAC address
+    ACCESS_NETWORK_STATE        — required to detect network changes (reconnect logic)
+    FOREGROUND_SERVICE          — required for persistent background receiver service (Android 9+)
+    FOREGROUND_SERVICE_CONNECTED_DEVICE — required for connectedDevice foreground service type (Android 14+)
+    CHANGE_WIFI_STATE           — required by WifiP2pManager for Miracast Wi-Fi Direct
+    ACCESS_FINE_LOCATION        — required by Wi-Fi P2P / Miracast discovery on Android 10+
+    RECEIVE_BOOT_COMPLETED      — required for "start on boot" feature
+
+    Explicitly NOT requested:
+    - RECORD_AUDIO      (we receive audio, we do not record it)
+    - READ/WRITE storage (we don't persist stream data)
+    - CAMERA            (not needed)
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Network permissions — local LAN only, no internet required -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Foreground service — keeps receiver alive when app is in background -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <!-- Start on boot -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Foreground service notification (Android 13+ requires runtime grant) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+        Declare this app as a TV app (leanback).
+        Required for the app to appear in the TV launcher.
+        uses-feature android.hardware.touchscreen is set to NOT required
+        because TV remotes are used, not touch screens.
+    -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+    <!--
+        leanback is required="false" so the SAME APK installs on a phone/tablet as well as
+        on Android TV / Fire TV. A phone is a perfectly good test target for the AirPlay
+        stack: mDNS, RTSP, decode and audio all exercise identically.
+    -->
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.wifi"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.location.gps"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.location.network"
+        android:required="false" />
+
+    <application
+        android:name=".MirrorApp"
+        android:allowBackup="false"
+        android:banner="@drawable/app_banner"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.IMirror"
+        android:supportsRtl="true">
+
+        <!--
+            MainActivity is the single entry point for the app.
+            It hosts both the WaitingScreen and StreamingScreen,
+            and starts/stops the AirPlayReceiver.
+
+            - launchMode="singleTop": prevents duplicate instances when
+              the user launches the app again while it's running
+            - screenOrientation="landscape": TV apps are always landscape
+            - configChanges: handle orientation/screen size changes ourselves
+              to avoid destroying the RTSP session on a config change
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:theme="@style/Theme.IMirror.Fullscreen">
+
+            <!--
+                Both launcher categories are declared: LEANBACK_LAUNCHER puts the app on the
+                TV home screen, LAUNCHER gives it a normal icon on a phone/tablet. Without
+                the second one the APK installs on a phone but has no way to open it.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            MirrorService — persistent foreground service that manages
+            AirPlay, Miracast, and Cast receivers.
+
+            - foregroundServiceType="connectedDevice": required for Android 14+
+              when a foreground service manages a connected device (BT/Wi-Fi/P2P)
+            - exported="false": only started from within this app via ServiceController
+            - START_STICKY: service restarts automatically if killed by the system
+        -->
+        <service
+            android:name=".service.MirrorService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+
+        <!--
+            BootReceiver — listens for BOOT_COMPLETED and starts MirrorService
+            if the "Start on boot" setting is enabled.
+            exported="false" because it is only triggered by the system broadcast.
+        -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+
+</manifest>

@@ -1,0 +1,80 @@
+# Android / Gradle build output
+*.iml
+.gradle/
+.toolchains/
+local.properties
+.idea/
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.ap_
+
+# ...but the prebuilt, release-signed APKs in apk/ ARE committed on purpose, so
+# anyone can install without building. See apk/README.md.
+!apk/**/*.apk
+
+# Android Studio
+*.iws
+*.ipr
+out/
+
+# Gradle wrapper — JAR must be committed so ./gradlew works after clone
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# Signing configs and keystores — NEVER commit these.
+# The release keystore lives outside the repo (~/.imirror-release.jks) so it cannot
+# be added by accident; these patterns are a second line of defence.
+*.jks
+*.keystore
+*.password
+keystore.properties
+release.properties
+release.env
+.release.env
+
+# Local configuration files
+local.defaults.properties
+
+# Generated files
+app/src/main/assets/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Test results
+test-results/
+lint-results/
+device-test-logs/
+
+# Profiling
+*.hprof
