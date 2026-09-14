@@ -68,6 +68,23 @@ class AudioVolumeAndReceiveTest {
         assertEquals(1408, packet.length)
     }
 
+    @Test
+    fun `full session teardown clears a photo takeover`() {
+        val context = mockk<Context>(relaxed = true)
+        every { context.getSystemService(Context.NSD_SERVICE) } returns mockk<NsdManager>(relaxed = true)
+        var clears = 0
+        val receiver = AirPlayReceiver(
+            context,
+            videoSurfaceProvider = { null },
+            onStateChanged = {},
+            onPhotoCleared = { clears++ }
+        )
+        AirPlayReceiver::class.java.getDeclaredMethod("releaseMediaComponents")
+            .apply { isAccessible = true }
+            .invoke(receiver)
+        assertEquals(1, clears)
+    }
+
     private fun field(target: Any, name: String): Any? = target.javaClass.getDeclaredField(name)
         .apply { isAccessible = true }.get(target)
     private fun setField(target: Any, name: String, value: Any) = target.javaClass.getDeclaredField(name)
