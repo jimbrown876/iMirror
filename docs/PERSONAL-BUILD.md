@@ -4,7 +4,21 @@ This GPL-3.0 personal fork retains upstream attribution and is based on
 `prat3ik/iMirror` main commit `9b52ce6d8bedb80ee557a5114d3cdbee4ab84f00`.
 It is not an Apple-certified receiver. No DRM bypass or paid service is included.
 
-## Current personal build: 1.0.4-personal (version code 5)
+## Current personal build: 1.0.5-personal (version code 6)
+
+- Treat iPhone's stream-scoped type-96 TEARDOWN as pause: stop that audio stream while retaining
+  the authenticated control, event, timing and FairPlay session for immediate same-session resume.
+- Flush pending PCM, RTP reorder/dedup state, decoder output and the hardware buffer on FLUSH or
+  PAUSE so a restarted sequence cannot be mistaken for stale audio.
+- Apply sender volume directly to decoded PCM16 samples on both audio paths. Android's track stays
+  at unity, avoiding TCL vendor-mixer behavior without enlarging either low-latency queue.
+- Keep a selected but quiet control socket alive through pause and media-app switching until
+  socket/session teardown. An abandoned sender remains replaceable after the existing bounded
+  handoff grace when another phone connects.
+- Retain cover/title/artist/album across same-session audio removal so resume does not depend on an
+  immediate metadata retransmission.
+
+The version 1.0.4 connection-resilience repairs below are retained:
 
 - Keep accepting control connections while a sender is active, reject probes during
   real media flow, and replace an abandoned Wi-Fi session after a bounded idle window.
@@ -89,6 +103,15 @@ followed by volume, repeated controls, bounded decoding and UDP packet reuse.
 still required; unit tests do not prove audible playback.** Compatibility varies
 by sender OS, codec and content provider.
 
+Living Room build 1.0.4 reproduced two additional receiver-side disconnects: a
+quiet selected route was killed by the receiver's 30-second idle timer without a
+sender teardown, and iPhone type-96 stream removal was incorrectly promoted to
+full session cleanup. In both cases iOS still showed the TV selected and Apple
+Music could skip tracks until the route was changed to iPhone Speaker and back.
+Version 1.0.5 removes that autonomous established-session expiry and preserves
+stream-scoped teardown state; both physical TVs still require the exact regression
+flow before this result can be called verified.
+
 Software audio queue budgets are approximately 140 ms on the realtime mirroring
 path and no more than roughly 225 ms for audio-only music burst recovery, not
 measured end-to-end latency. Neither path forces the queue to prefill, so healthy
@@ -96,6 +119,6 @@ steady-state playback does not inherit that full capacity. The TCL hardware repo
 AudioTrack buffer and declines Android's FAST flag. Sender buffering, network,
 decoding, and hardware output add delay; no total-latency guarantee is made.
 
-FLUSH/seek behavior and unsupported buffered-audio paths remain separate follow-up
-tests if they reproduce after the artwork repair. HEVC and protected-video
+Unsupported buffered-audio paths remain separate follow-up tests if they reproduce.
+HEVC and protected-video
 compatibility are not claimed. See [NOTICE](../NOTICE.md) for upstream components.

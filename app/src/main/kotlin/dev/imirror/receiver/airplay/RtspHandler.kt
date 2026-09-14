@@ -54,6 +54,8 @@ open class RtspHandler(
     private val onBufferedAudioStart: () -> Int = { 0 },
     /** Stops the buffered audio-only stream (type 103 TEARDOWN). */
     private val onBufferedAudioStop: () -> Unit = {},
+    /** Discards queued audio for FLUSH/PAUSE without ending the authenticated AirPlay session. */
+    private val onAudioFlush: () -> Unit = {},
     /** Sender volume change (AirPlay dB: −30…0, or ≤ −144 = mute) via SET_PARAMETER. */
     private val onVolume: (Float) -> Unit = {},
     /** Now-playing track metadata (DMAP) from SET_PARAMETER — any field may be null. */
@@ -278,18 +280,16 @@ open class RtspHandler(
         // macOS may finish the PIN exchange on a new socket. The pending exchange has an owner and
         // expiry, while this connection starts unverified regardless of any previous pairing.
         currentRemoteAddress = socket.inetAddress
-
         try {
             while (running && !socket.isClosed) {
                 val request = try {
                     requestReader.read(inputStream)
                 } catch (_: SocketTimeoutException) {
                     if (established) {
-                        val controlIdleMs = activeControlIdleMillis(socket)
-                        if (hasRecentMediaActivity() || controlIdleMs < ESTABLISHED_ABANDON_TIMEOUT_MS) {
-                            continue
-                        }
-                        Logger.w("Established AirPlay sender has no control or media activity for ${controlIdleMs / 1000}s — releasing stale sender")
+                        // A selected AirPlay route may legitimately go silent while paused or while
+                        // the user switches apps. Keep its TCP session until EOF/session teardown;
+                        // the accept loop can still evict it when a new sender arrives after grace.
+                        continue
                     } else {
                         Logger.d("Incomplete AirPlay handshake timed out")
                     }
@@ -308,7 +308,9 @@ open class RtspHandler(
                     synchronized(clientLock) {
                         if (activeClient === socket) activeClientEstablished = true
                     }
-                    socket.soTimeout = ESTABLISHED_LIVENESS_POLL_MS
+                    // Do not autonomously expire a selected but quiet AirPlay route. A new sender
+                    // still displaces an idle incumbent through decideIncomingClient().
+                    socket.soTimeout = 0
                 }
 
                 // After RECORD on a legacy SDP session: a session WITH video switches to interleaved
@@ -360,11 +362,6 @@ open class RtspHandler(
                 if (established) onStreamingStopped()
             }
         }
-    }
-
-    private fun activeControlIdleMillis(socket: Socket): Long = synchronized(clientLock) {
-        if (activeClient !== socket || activeClientLastRequestNanos == 0L) Long.MAX_VALUE else
-            (System.nanoTime() - activeClientLastRequestNanos).coerceAtLeast(0L) / 1_000_000L
     }
 
     /** Quiet, verified or accepted legacy media sessions must not inherit the handshake timeout. */
@@ -943,27 +940,23 @@ open class RtspHandler(
     /**
      * Handles TEARDOWN. A TEARDOWN may target SPECIFIC streams (AirPlay 2 dynamic stream removal —
      * e.g. macOS drops the audio stream when playback stops) or the whole session. If the body lists
-     * streams and they're audio-only, we stop just the audio and KEEP the mirror running; otherwise
-     * we tear the whole session down. (Previously any TEARDOWN killed the mirror, so stopping audio
-     * on the Mac ended screen mirroring entirely.)
+     * streams, we stop only those streams and preserve the authenticated control/event/timing
+     * session even when no media streams remain. iOS uses a type-96 stream TEARDOWN for pause, then
+     * re-adds that stream on resume without repeating the key exchange. Only a bodyless/session
+     * TEARDOWN ends the whole session.
      */
     open fun handleTeardownInternal(request: RtspRequest): RtspResponse {
         val streamTypes = parseTeardownStreamTypes(request.bodyBytes)
         if (streamTypes != null && streamTypes.isNotEmpty()) {
             // Stream-level teardown: stop ONLY the listed streams. Keep the session (keys, NTP,
             // event channel) alive so the remaining stream keeps running and a stopped one can be
-            // re-added later — e.g. audio keeps playing with video gone, or video keeps mirroring
-            // with audio stopped. But if this removes the LAST active stream (e.g. macOS names both
-            // 96 and 110 to end the session), fall through to a full teardown so cleanup isn't left
-            // to the eventual socket close.
+            // re-added later — e.g. audio keeps playing with video gone, or a paused audio stream is
+            // re-created on resume using the keys retained by the live control session.
             if (streamTypes.contains(96)) { onMirrorAudioStop(); activeStreamTypes.remove(96) }
             if (streamTypes.contains(110)) { onMirrorVideoStop(); activeStreamTypes.remove(110) }
             if (streamTypes.contains(103)) { onBufferedAudioStop(); activeStreamTypes.remove(103) }
-            if (activeStreamTypes.isNotEmpty()) {
-                Logger.i("TEARDOWN streams=$streamTypes — stopped those, session continues (active=$activeStreamTypes)")
-                return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
-            }
-            Logger.i("TEARDOWN streams=$streamTypes — last stream removed, ending session")
+            Logger.i("TEARDOWN streams=$streamTypes — stopped those, control session continues (active=$activeStreamTypes)")
+            return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
         } else {
             Logger.i("TEARDOWN (session, body=${request.bodyBytes.size}B) — streaming stopping")
         }
@@ -1035,14 +1028,17 @@ open class RtspHandler(
     }
 
     /** Handles FLUSH — macOS requests we discard buffered media data (seek/pause). */
-    private fun handleFlush(@Suppress("UNUSED_PARAMETER") request: RtspRequest): RtspResponse {
-        return RtspResponse(statusCode = 200, statusMessage = "OK")
+    private fun handleFlush(request: RtspRequest): RtspResponse {
+        onAudioFlush()
+        Logger.d("FLUSH received — queued audio discarded")
+        return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
     }
 
     /** Handles PAUSE — suspends media delivery. Responds 200 OK; resume arrives as RECORD. */
     open fun handlePauseInternal(request: RtspRequest): RtspResponse {
-        Logger.d("PAUSE received")
-        return RtspResponse(statusCode = 200, statusMessage = "OK")
+        onAudioFlush()
+        Logger.d("PAUSE received — control session retained")
+        return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
     }
 
     /** Handles AirPlay photo sharing: HTTP `PUT /photo` with a JPEG/PNG body. */
@@ -1128,8 +1124,6 @@ open class RtspHandler(
 
     companion object {
         private const val HANDSHAKE_IDLE_TIMEOUT_MS = 60_000
-        private const val ESTABLISHED_LIVENESS_POLL_MS = 5_000
-        private const val ESTABLISHED_ABANDON_TIMEOUT_MS = 30_000L
         private const val PIN_HANDSHAKE_LIFETIME_NANOS = 180_000_000_000L
         private const val RTSP_PORT = 7000
 

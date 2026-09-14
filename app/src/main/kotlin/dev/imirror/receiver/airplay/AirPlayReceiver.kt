@@ -93,7 +93,9 @@ class AirPlayReceiver(
     /**
      * Audio-only "now playing" state. Emits a [NowPlayingInfo] when audio is streaming WITHOUT video
      * (system audio, Apple Music, podcasts) so the UI can show a now-playing card instead of a black
-     * surface; emits null when video is mirroring (the video screen takes over) or audio stops.
+     * surface; emits null when video is mirroring (the video screen takes over) or the AirPlay
+     * route ends. A paused audio stream keeps its last metadata visible while the route remains
+     * connected.
      */
     private val onNowPlayingChanged: (NowPlayingInfo?) -> Unit = {},
     /** Pairing PIN to show ([pin]) or hide (null) on the TV during SRP pair-setup. */
@@ -138,9 +140,12 @@ class AirPlayReceiver(
     @Volatile private var mirrorAesIv: ByteArray? = null
 
     // ─── Now-playing (audio-only) state ──────────────────────────────────────
-    // The now-playing card shows only when audio plays WITHOUT video. We track both stream kinds
-    // plus the latest DMAP metadata/artwork and recompute on every change (see [emitNowPlaying]).
+    // The now-playing card shows while an audio route is connected WITHOUT video, including while
+    // playback is paused. A stream may be torn down and recreated inside one live AirPlay route, so
+    // route presence is tracked separately from whether audio packets are currently flowing.
+    // Latest DMAP metadata/artwork is recomputed on every change (see [emitNowPlaying]).
     @Volatile private var audioPlaying = false
+    @Volatile private var audioRouteActive = false
     @Volatile private var videoPlaying = false
     @Volatile private var npSenderName = "AirPlay"
     @Volatile private var npTitle: String? = null
@@ -251,12 +256,22 @@ class AirPlayReceiver(
                 mediaSession.activate()
                 startMirrorKeys(aesKey, ecdhSecret, aesIv, remoteAddr, senderTimingPort)
             },
-            onMirrorStreamStart = { streamConnectionId -> startMirrorStream(streamConnectionId) },
-            onMirrorAudioStart = { sampleRate, channels, ct, spf -> startMirrorAudio(sampleRate, channels, ct, spf) },
+            onMirrorStreamStart = { streamConnectionId ->
+                mediaSession.activate()
+                startMirrorStream(streamConnectionId)
+            },
+            onMirrorAudioStart = { sampleRate, channels, ct, spf ->
+                mediaSession.activate()
+                startMirrorAudio(sampleRate, channels, ct, spf)
+            },
             onMirrorAudioStop = { stopMirrorAudio() },
             onMirrorVideoStop = { stopMirrorVideo() },
-            onBufferedAudioStart = { startBufferedAudio() },
+            onBufferedAudioStart = {
+                mediaSession.activate()
+                startBufferedAudio()
+            },
             onBufferedAudioStop = { stopBufferedAudio() },
+            onAudioFlush = { flushAudio() },
             onVolume = { v -> updateAudioVolume(v) },
             onNowPlayingMetadata = { title, artist, album ->
                 npTitle = title; npArtist = artist; npAlbum = album
@@ -310,6 +325,7 @@ class AirPlayReceiver(
                     npSenderName = session.senderName.ifBlank { npSenderName }
                     videoPlaying = session.hasVideo
                     audioPlaying = session.hasAudio
+                    audioRouteActive = session.hasAudio
                     emitNowPlaying()
                     onSenderNameChanged(session.senderName)
                     if (generation == legacyStartupGeneration) onStateChanged(ProtocolState.CONNECTED)
@@ -442,6 +458,12 @@ class AirPlayReceiver(
         audioServer?.setVolume(volume)
     }
 
+    /** Discards queued audio while retaining pairing/FairPlay state for pause, seek, and resume. */
+    private fun flushAudio() {
+        audioPlayer?.flush()
+        audioServer?.flush()
+    }
+
     /**
      * Opens a UDP socket on [AUDIO_RTP_PORT] and feeds every received packet to
      * [AudioPlayer.playAudioPacket].
@@ -545,22 +567,23 @@ class AirPlayReceiver(
         val aesKey = mirrorAesKey ?: run { Logger.e("audio start before keys set"); return 0 to 0 }
         val ecdhSecret = mirrorEcdhSecret ?: return 0 to 0
         val aesIv = mirrorAesIv ?: return 0 to 0
+        audioServer?.stop()
         val server = AudioStreamServer(aesKey, ecdhSecret, aesIv, sampleRate, channels, codecType, framesPerPacket)
             .also { audioServer = it; it.setVolume(senderVolumeDb); it.start(scope) }
         audioPlaying = true
+        audioRouteActive = true
         emitNowPlaying()
         Logger.i("Mirror audio server started: dataPort=${server.dataPort} controlPort=${server.controlPort}")
         return server.dataPort to server.controlPort
     }
 
-    /** Stops ONLY the mirror audio stream (macOS dynamic-stream TEARDOWN) — video keeps running. */
+    /** Stops only mirror audio while retaining same-session metadata for an immediate resume. */
     private fun stopMirrorAudio() {
         audioServer?.stop()
         audioServer = null
         audioPlaying = false
-        clearNowPlayingMetadata()
         emitNowPlaying()
-        Logger.i("Mirror audio stream stopped (video mirroring continues)")
+        Logger.i("Mirror audio stream stopped; session metadata retained for resume")
     }
 
     /** Stops ONLY the mirror video stream (macOS dynamic-stream TEARDOWN) — audio keeps playing. */
@@ -601,19 +624,19 @@ class AirPlayReceiver(
         bufferedAudioServer?.stop()
         val server = BufferedAudioServer().also { bufferedAudioServer = it; it.start(scope) }
         audioPlaying = true   // buffered audio (type 103) is always audio-only
+        audioRouteActive = true
         emitNowPlaying()
         Logger.i("Buffered audio server started: dataPort=${server.dataPort}")
         return server.dataPort
     }
 
-    /** Stops the buffered audio-only stream (type 103 TEARDOWN). */
+    /** Stops the buffered audio stream while retaining same-route metadata for resume. */
     private fun stopBufferedAudio() {
         bufferedAudioServer?.stop()
         bufferedAudioServer = null
         audioPlaying = false
-        clearNowPlayingMetadata()
         emitNowPlaying()
-        Logger.i("Buffered audio stream stopped")
+        Logger.i("Buffered audio stream stopped; session metadata retained for resume")
     }
 
     /** Clears the video NAL callback, closes the audio socket, and releases media components. */
@@ -637,7 +660,7 @@ class AirPlayReceiver(
         try { eventSocket?.close() } catch (e: Exception) { /* non-fatal */ }
         eventSocket = null
         // Clear the FairPlay/ECDH keys on FULL teardown only. This method runs on a genuine session
-        // end (last-stream / session TEARDOWN, or control-connection close) — NOT on a per-stream
+        // end (session-level TEARDOWN or control-connection close) — NOT on a per-stream
         // teardown, which goes through stopMirrorAudio/stopMirrorVideo and leaves the keys intact so
         // macOS can re-add a dynamic stream on the same live session without re-sending keys (that
         // dynamic-readd path is why the keys must survive a stream stop). Clearing here prevents a
@@ -655,14 +678,15 @@ class AirPlayReceiver(
         onPhotoCleared()
         // Session fully torn down — clear now-playing so the UI leaves the audio card.
         audioPlaying = false
+        audioRouteActive = false
         videoPlaying = false
         clearNowPlayingMetadata()
         emitNowPlaying()
     }
 
-    /** Pushes the current now-playing state out: a [NowPlayingInfo] when audio plays without video, else null. */
+    /** Pushes now-playing while an audio route is connected without video, including when paused. */
     private fun emitNowPlaying() {
-        val show = audioPlaying && !videoPlaying
+        val show = audioRouteActive && !videoPlaying
         onNowPlayingChanged(
             if (show) NowPlayingInfo(npSenderName, npTitle, npArtist, npAlbum, npArtwork) else null
         )

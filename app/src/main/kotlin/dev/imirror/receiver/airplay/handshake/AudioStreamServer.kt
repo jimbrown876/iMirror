@@ -10,6 +10,7 @@ import android.media.MediaFormat
 import android.os.Build
 import dev.imirror.receiver.airplay.audioRtpPayloadRange
 import dev.imirror.receiver.airplay.airplayVolumeGain
+import dev.imirror.receiver.airplay.applyPcm16LeGainInPlace
 import dev.imirror.receiver.airplay.StreamStats
 import dev.imirror.receiver.util.Logger
 import kotlinx.coroutines.CoroutineScope
@@ -20,6 +21,7 @@ import java.net.DatagramSocket
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -114,6 +116,7 @@ class AudioStreamServer(
     @Volatile private var qDropCount = 0
     @Volatile private var resendReqCount = 0
     @Volatile private var resendFillCount = 0
+    private val flushRequested = AtomicBoolean(false)
 
     /** UDP port macOS sends the audio RTP stream to (returned in the SETUP response). */
     val dataPort: Int get() = socket.localPort
@@ -172,6 +175,23 @@ class AudioStreamServer(
         // this thread races decodeFrame on the playback thread and crashes the whole process with a
         // native SIGABRT ("pthread_mutex_destroy called on a destroyed mutex" inside libstagefright).
         // Flipping `running` makes the playback loop exit within one poll timeout and clean up safely.
+    }
+
+    /**
+     * Discards audio queued before an AirPlay FLUSH/PAUSE while retaining ports, keys, and threads.
+     * Codec and AudioTrack flushing is requested here but performed by their playback-owner thread.
+     */
+    fun flush() {
+        synchronized(reorderLock) {
+            frameQueue.clear()
+            reorder.clear()
+            seenSeqs.clear()
+            seenSeqSet.clear()
+            nextSeq = -1
+            maxSeq = -1
+            flushRequested.set(true)
+        }
+        StreamStats.audioQueue = 0
     }
 
     /** Receive thread: pull RTP packets off the data socket and feed them to the reorder buffer. */
@@ -291,6 +311,7 @@ class AudioStreamServer(
             initDecoder()
             initAudioTrack()
             while (running) {
+                drainPendingFlush()
                 val payload = frameQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
                 try {
                     val decrypted = decryptPacket(payload)
@@ -324,6 +345,8 @@ class AudioStreamServer(
 
     private fun writePcm(pcm: ByteArray) {
         val track = audioTrack ?: return
+        // Apply sender volume to PCM so TCL vendor output cannot ignore AudioTrack's per-track gain.
+        applyPcm16LeGainInPlace(pcm, volumeGain)
         var offset = 0
         while (running && offset < pcm.size) {
             val written = track.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
@@ -409,7 +432,26 @@ class AudioStreamServer(
     fun setVolume(airplayVolume: Float) {
         if (!airplayVolume.isFinite()) return
         volumeGain = airplayVolumeGain(airplayVolume)
-        runCatching { audioTrack?.setVolume(volumeGain) }
+    }
+
+    /** Playback-thread-only portion of FLUSH; avoids cross-thread MediaCodec/AudioTrack races. */
+    private fun drainPendingFlush() {
+        if (!flushRequested.getAndSet(false)) return
+        decodedSamples = 0L
+        runCatching {
+            // Synchronous ByteBuffer-mode codecs resume on the next dequeue after flush; calling
+            // start() again is for asynchronous callback mode and breaks some vendor codecs.
+            codec?.flush()
+        }.onFailure { Logger.w("Audio decoder flush failed (non-fatal): ${it.message}") }
+        runCatching {
+            audioTrack?.let {
+                val resume = it.playState == AudioTrack.PLAYSTATE_PLAYING
+                if (resume) it.pause()
+                it.flush()
+                if (resume && running) it.play()
+            }
+        }.onFailure { Logger.w("AudioTrack flush failed (non-fatal): ${it.message}") }
+        Logger.d("AudioStreamServer flush complete")
     }
 
     private fun initAudioTrack() {
@@ -442,7 +484,8 @@ class AudioStreamServer(
                 if (Build.VERSION.SDK_INT >= 26) setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             }
             .build()
-            .also { it.setVolume(volumeGain); it.play() }
+            // Sender gain is applied to PCM samples, leaving the platform track at unity.
+            .also { it.setVolume(1f); it.play() }
     }
 
     companion object {

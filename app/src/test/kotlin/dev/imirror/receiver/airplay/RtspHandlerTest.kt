@@ -33,6 +33,8 @@ class RtspHandlerTest {
     private var lastPhotoType: PhotoImageType? = null
     private var audioStopped = false
     private var videoStopped = false
+    private var audioFlushes = 0
+    private var audioStartedArgs: List<Int>? = null
 
     @Before
     fun setup() {
@@ -44,6 +46,8 @@ class RtspHandlerTest {
         lastPhotoType = null
         audioStopped = false
         videoStopped = false
+        audioFlushes = 0
+        audioStartedArgs = null
     }
 
     // ─── OPTIONS ─────────────────────────────────────────────────────────────
@@ -226,22 +230,69 @@ class RtspHandlerTest {
     }
 
     @Test
-    fun `TEARDOWN naming all streams ends the session`() {
+    fun `TEARDOWN naming all active streams stops media but preserves control session`() {
         val handler = createTestHandler()
         handler.seedActiveStreams(96, 110)
         handler.handleTeardownPublic(teardownRequest(teardownBody(96, 110)))
         assertTrue("audio should be stopped", audioStopped)
         assertTrue("video should be stopped", videoStopped)
-        assertTrue("session should end when the last stream is removed", streamingStopped)
+        assertFalse("stream-scoped teardown must retain the control session", streamingStopped)
     }
 
     @Test
-    fun `TEARDOWN of the last remaining stream ends the session`() {
+    fun `TEARDOWN of last audio stream preserves session for resume`() {
         val handler = createTestHandler()
-        handler.seedActiveStreams(110)
-        handler.handleTeardownPublic(teardownRequest(teardownBody(110)))
-        assertTrue("video should be stopped", videoStopped)
-        assertTrue("session should end when no streams remain", streamingStopped)
+        handler.seedActiveStreams(96)
+        handler.handleTeardownPublic(teardownRequest(teardownBody(96)))
+        assertTrue("audio should be stopped", audioStopped)
+        assertFalse("video should not be stopped", videoStopped)
+        assertFalse("pause-style stream teardown must retain keys/control", streamingStopped)
+    }
+
+    @Test
+    fun `stream scoped audio TEARDOWN can be followed by audio SETUP on same session`() {
+        val handler = createTestHandler(audioEnabled = true)
+        handler.seedActiveStreams(96)
+
+        val teardown = handler.handleTeardownPublic(teardownRequest(teardownBody(96)))
+        assertEquals(200, teardown.statusCode)
+        assertTrue(audioStopped)
+        assertFalse(streamingStopped)
+        assertTrue(handler.activeStreamsSnapshot().isEmpty())
+
+        val setup = handler.routeRequest(mirrorAudioSetupRequest())
+        assertEquals(200, setup.statusCode)
+        assertEquals(listOf(44100, 2, 2, 352), audioStartedArgs)
+        assertEquals(setOf(96), handler.activeStreamsSnapshot())
+        assertFalse(streamingStopped)
+        val streams = PlistCodec.decode(requireNotNull(setup.bodyBytes))["streams"] as List<*>
+        val stream = streams.single() as Map<*, *>
+        assertEquals(96L, stream["type"])
+        assertEquals(7100L, stream["dataPort"])
+        assertEquals(7101L, stream["controlPort"])
+    }
+
+    @Test
+    fun `FLUSH and PAUSE discard queued audio without ending session`() {
+        val handler = createTestHandler()
+        handler.seedMirrorSession()
+        val flush = handler.routeRequest(
+            RtspRequest(method = "FLUSH", uri = "", headers = emptyMap(), body = "")
+        )
+        val pause = handler.handlePausePublic(
+            RtspRequest(method = "PAUSE", uri = "", headers = emptyMap(), body = "")
+        )
+
+        assertEquals(200, flush.statusCode)
+        assertEquals(200, pause.statusCode)
+        assertEquals(2, audioFlushes)
+        assertFalse(streamingStopped)
+
+        val resume = handler.handleRecordPublic(
+            RtspRequest(method = "RECORD", uri = "", headers = emptyMap(), body = "")
+        )
+        assertEquals(200, resume.statusCode)
+        assertFalse("mirror RECORD must retain the existing control session", streamingStopped)
     }
 
     @Test
@@ -320,7 +371,8 @@ class RtspHandlerTest {
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
 
-    private fun createTestHandler(): TestableRtspHandler = TestableRtspHandler(
+    private fun createTestHandler(audioEnabled: Boolean = false): TestableRtspHandler = TestableRtspHandler(
+        audioEnabled = audioEnabled,
         onStreamingStarted = { session ->
             streamingStarted = true
             lastSession = session
@@ -332,8 +384,13 @@ class RtspHandlerTest {
             lastPhotoType = imageType
         },
         onPhotoCleared = { photoCleared = true },
+        onMirrorAudioStart = { sampleRate, channels, codecType, framesPerPacket ->
+            audioStartedArgs = listOf(sampleRate, channels, codecType, framesPerPacket)
+            7100 to 7101
+        },
         onMirrorAudioStop = { audioStopped = true },
-        onMirrorVideoStop = { videoStopped = true }
+        onMirrorVideoStop = { videoStopped = true },
+        onAudioFlush = { audioFlushes++ }
     )
 
     /** Binary-plist TEARDOWN body naming the given stream types, e.g. `{streams:[{type:96}]}`. */
@@ -342,6 +399,17 @@ class RtspHandlerTest {
 
     private fun teardownRequest(bytes: ByteArray) =
         RtspRequest(method = "TEARDOWN", uri = "", headers = emptyMap(), body = "", bodyBytes = bytes)
+
+    private fun mirrorAudioSetupRequest(): RtspRequest {
+        val body = PlistCodec.encode(mapOf("streams" to listOf(mapOf(
+            "type" to 96L,
+            "sr" to 44100L,
+            "channels" to 2L,
+            "ct" to 2L,
+            "spf" to 352L
+        ))))
+        return RtspRequest(method = "SETUP", uri = "", headers = emptyMap(), body = "", bodyBytes = body)
+    }
 
     companion object {
         // Minimal valid SDP with H.264 video + AAC-ELD audio (base64 SPS/PPS included)
@@ -384,22 +452,34 @@ class RtspHandlerTest {
 class TestableRtspHandler(
     onStreamingStarted: (SessionDescription) -> Unit,
     onStreamingStopped: () -> Unit,
+    audioEnabled: Boolean = false,
     onPhotoReceived: (ByteArray, PhotoImageType) -> Unit = { _, _ -> },
     onPhotoCleared: () -> Unit = {},
+    onMirrorAudioStart: (Int, Int, Int, Int) -> Pair<Int, Int> = { _, _, _, _ -> 0 to 0 },
     onMirrorAudioStop: () -> Unit = {},
-    onMirrorVideoStop: () -> Unit = {}
+    onMirrorVideoStop: () -> Unit = {},
+    onAudioFlush: () -> Unit = {}
 ) : RtspHandler(
     context = io.mockk.mockk(relaxed = true),
+    audioEnabled = audioEnabled,
     videoSurfaceProvider = { null },
     onStreamingStarted = onStreamingStarted,
     onStreamingStopped = onStreamingStopped,
     onPhotoReceived = onPhotoReceived,
     onPhotoCleared = onPhotoCleared,
+    onMirrorAudioStart = onMirrorAudioStart,
     onMirrorAudioStop = onMirrorAudioStop,
-    onMirrorVideoStop = onMirrorVideoStop
+    onMirrorVideoStop = onMirrorVideoStop,
+    onAudioFlush = onAudioFlush
 ) {
     /** Test seam: mark mirror streams active without driving the full FairPlay SETUP handshake. */
     fun seedActiveStreams(vararg types: Int) { activeStreamTypes.addAll(types.toList()) }
+    fun activeStreamsSnapshot(): Set<Int> = activeStreamTypes.toSet()
+    fun seedMirrorSession() = setPrivateBoolean("isMirrorSession", true)
+
+    private fun setPrivateBoolean(name: String, value: Boolean) {
+        RtspHandler::class.java.getDeclaredField(name).apply { isAccessible = true }.setBoolean(this, value)
+    }
 
     fun handleOptionsPublic(req: RtspRequest) = handleOptionsInternal(req)
     fun handleAnnouncePublic(req: RtspRequest) = handleAnnounceInternal(req)
