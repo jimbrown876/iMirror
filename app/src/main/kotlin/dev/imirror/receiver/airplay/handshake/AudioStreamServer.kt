@@ -7,6 +7,9 @@ import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Build
+import dev.imirror.receiver.airplay.audioRtpPayloadRange
+import dev.imirror.receiver.airplay.airplayVolumeGain
 import dev.imirror.receiver.airplay.StreamStats
 import dev.imirror.receiver.util.Logger
 import kotlinx.coroutines.CoroutineScope
@@ -74,7 +77,10 @@ class AudioStreamServer(
     // Decoded-audio jitter buffer: raw (post-dedup) RTP payloads handed from the receive thread to
     // the playback thread. Bounded so a stalled player can't grow latency unboundedly — if it fills
     // we drop the oldest frame (a brief glitch is better than ever-growing audio lag).
-    private val frameQueue = ArrayBlockingQueue<ByteArray>(AUDIO_QUEUE_CAPACITY)
+    private val packetFrames = when (codecType) { CT_AAC_ELD -> 480; CT_AAC_LC -> 1024; else -> framesPerPacket }
+    private val frameQueue = ArrayBlockingQueue<ByteArray>(packetBudget(sampleRate, packetFrames, 100))
+    private val reorderHold = packetBudget(sampleRate, packetFrames, 40)
+    private var decodedSamples = 0L
 
     // RTP duplicate suppression. macOS sends each realtime-audio packet 2–3× for redundancy
     // (same 16-bit sequence number). Decoding every copy feeds the AAC decoder duplicate frames
@@ -132,6 +138,7 @@ class AudioStreamServer(
             while (running) {
                 pkt.length = buf.size     // reset capacity before each receive (see runReceive)
                 controlSocket.receive(pkt)
+                if (pkt.length < 2) continue
                 senderCtrlAddr = pkt.socketAddress   // where to send resend requests
                 if (ctrlCount < 6) {
                     Logger.i("Audio CTRL[$ctrlCount] ${pkt.length}B: ${hex(pkt.data, minOf(20, pkt.length))}")
@@ -197,10 +204,10 @@ class AudioStreamServer(
      * cross-thread handoff. Thread-safe: the reorder buffer + dedup are accessed under [reorderLock].
      */
     private fun handleRtpPacket(src: ByteArray, offset: Int, length: Int) {
-        if (length <= RTP_HEADER) return
+        val range = audioRtpPayloadRange(src, offset, length) ?: return
         val seq = ((src[offset + 2].toInt() and 0xFF) shl 8) or (src[offset + 3].toInt() and 0xFF)
         // RAOP RTP: 12-byte header, then AES-128-CBC-encrypted audio payload (copied out of src).
-        val payload = src.copyOfRange(offset + RTP_HEADER, offset + length)
+        val payload = src.copyOfRange(range.first, range.last + 1)
         var resend: IntArray? = null
         synchronized(reorderLock) {
             if (isDuplicateSeq(seq)) { dupCount++; return }
@@ -226,8 +233,8 @@ class AudioStreamServer(
         releaseContiguous()
         // If a hole stays unfilled and the buffer runs too far ahead, skip past it so playback never
         // stalls (a brief glitch beats indefinite silence).
-        if (reorder.isNotEmpty() && seqDiff(maxSeq, nextSeq) > MAX_REORDER_HOLD) {
-            while (seqDiff(maxSeq, nextSeq) > MAX_REORDER_HOLD && !reorder.containsKey(nextSeq)) {
+        if (reorder.isNotEmpty() && seqDiff(maxSeq, nextSeq) > reorderHold) {
+            while (seqDiff(maxSeq, nextSeq) > reorderHold && !reorder.containsKey(nextSeq)) {
                 nextSeq = (nextSeq + 1) and 0xFFFF
             }
             releaseContiguous()
@@ -306,7 +313,17 @@ class AudioStreamServer(
     private fun playAlacFrame(frame: ByteArray) {
         val pcm = alac?.decode(frame) ?: return
         if (firstPcm) { Logger.i("Audio: first decoded ALAC PCM (${pcm.size}B) → AudioTrack"); firstPcm = false }
-        audioTrack?.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
+        writePcm(pcm)
+    }
+
+    private fun writePcm(pcm: ByteArray) {
+        val track = audioTrack ?: return
+        var offset = 0
+        while (running && offset < pcm.size) {
+            val written = track.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
+            check(written > 0) { "AudioTrack write failed: $written" }
+            offset += written
+        }
     }
 
     /** True if this RTP sequence was already processed (a redundant retransmission). */
@@ -329,11 +346,20 @@ class AudioStreamServer(
 
     private fun decodeFrame(aac: ByteArray) {
         val mc = codec ?: return
-        val inIdx = mc.dequeueInputBuffer(10_000)
+        var inIdx = mc.dequeueInputBuffer(0)
+        if (inIdx < 0) {
+            drainDecodedOutput(mc)
+            inIdx = mc.dequeueInputBuffer(10_000)
+        }
         if (inIdx >= 0) {
             mc.getInputBuffer(inIdx)!!.apply { clear(); put(aac) }
-            mc.queueInputBuffer(inIdx, 0, aac.size, 0, 0)
+            mc.queueInputBuffer(inIdx, 0, aac.size, decodedSamples * 1_000_000 / sampleRate, 0)
+            decodedSamples += packetFrames
         }
+        drainDecodedOutput(mc)
+    }
+
+    private fun drainDecodedOutput(mc: MediaCodec) {
         val info = MediaCodec.BufferInfo()
         var outIdx = mc.dequeueOutputBuffer(info, 0)
         while (outIdx >= 0) {
@@ -343,8 +369,7 @@ class AudioStreamServer(
             if (firstPcm) { Logger.i("Audio: first decoded PCM (${pcm.size}B) → AudioTrack"); firstPcm = false }
             // Blocking write paces playback to the audio clock and drops no PCM. Safe here because
             // this runs on the dedicated playback thread, not the socket-receive thread.
-            audioTrack?.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
-            mc.releaseOutputBuffer(outIdx, false)
+            try { writePcm(pcm) } finally { mc.releaseOutputBuffer(outIdx, false) }
             outIdx = mc.dequeueOutputBuffer(info, 0)
         }
     }
@@ -376,16 +401,18 @@ class AudioStreamServer(
 
     /** Sets playback volume from the sender's AirPlay volume (−30 dB … 0 dB, or ≤ −144 = mute). */
     fun setVolume(airplayVolume: Float) {
-        volumeGain = if (airplayVolume <= -144f) 0f else ((airplayVolume + 30f) / 30f).coerceIn(0f, 1f)
+        if (!airplayVolume.isFinite()) return
+        volumeGain = airplayVolumeGain(airplayVolume)
         runCatching { audioTrack?.setVolume(volumeGain) }
     }
 
     private fun initAudioTrack() {
         val channelMask = if (channels >= 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
         val minBuf = AudioTrack.getMinBufferSize(sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
+        require(minBuf > 0) { "AudioTrack rejected negotiated audio format: $minBuf" }
         val bytesPerSec = sampleRate * channels * 2
         Logger.i("AudioTrack: minBuf=${minBuf}B (~${minBuf * 1000 / bytesPerSec}ms), " +
-            "buffer=${minBuf * 2}B (~${minBuf * 2 * 1000 / bytesPerSec}ms latency)")
+            "buffer=${minBuf}B (~${minBuf * 1000 / bytesPerSec}ms latency)")
         audioTrack = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -405,6 +432,9 @@ class AudioStreamServer(
             // only needs the floor. (If this underruns/crackles on load, raise toward minBuf*2.)
             .setBufferSizeInBytes(minBuf)
             .setTransferMode(AudioTrack.MODE_STREAM)
+            .apply {
+                if (Build.VERSION.SDK_INT >= 26) setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+            }
             .build()
             .also { it.setVolume(volumeGain); it.play() }
     }
@@ -427,13 +457,15 @@ class AudioStreamServer(
 
         // Max packets to hold while waiting for a gap to fill before skipping it (bounds the worst-case
         // added latency to ~this many frames; in-order traffic adds zero). ~32 ≈ 0.25–0.35 s.
-        private const val MAX_REORDER_HOLD = 32
 
         // Don't ask for an absurd resend range (a huge gap = a real stall, not a few lost packets).
         private const val MAX_RESEND_RANGE = 128
 
-        // Jitter buffer depth between the receive and playback threads (~1 s at 92 frames/s).
-        private const val AUDIO_QUEUE_CAPACITY = 96
+        /** Packet-count budget scales with negotiated codec duration, rather than adding ~1s. */
+        internal fun packetBudget(sampleRate: Int, frames: Int, milliseconds: Int): Int {
+            require(sampleRate > 0 && frames > 0 && milliseconds > 0)
+            return (sampleRate.toLong() * milliseconds / (frames.toLong() * 1000)).toInt().coerceIn(1, 32)
+        }
 
         // Sliding window of recently-played RTP sequence numbers for duplicate suppression.
         // ~11 s at 92 packets/s — far longer than any retransmit gap, far shorter than the

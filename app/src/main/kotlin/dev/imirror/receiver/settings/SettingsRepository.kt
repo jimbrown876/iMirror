@@ -105,13 +105,13 @@ class SettingsRepository(private val context: Context) {
      * Missing keys fall back to their default values in [AppSettings].
      */
     private fun Preferences.toAppSettings(): AppSettings = AppSettings(
-        displayName        = this[Keys.DISPLAY_NAME]            ?: "Pratik AirPlay",
-        airPlayEnabled     = this[Keys.AIRPLAY_ENABLED]         ?: true,
-        airPlayPinAuthEnabled = this[Keys.AIRPLAY_PIN_AUTH]     ?: false,
-        startOnBoot        = this[Keys.START_ON_BOOT]           ?: false,
-        showDebugOverlay   = this[Keys.SHOW_DEBUG_OVERLAY]      ?: false,
-        forceHighResolution = this[Keys.FORCE_HIGH_RESOLUTION]  ?: false,
-        mirrorAudioEnabled = this[Keys.MIRROR_AUDIO_ENABLED]    ?: true
+        displayName        = this[Keys.DISPLAY_NAME]            ?: AppSettings.DEFAULT.displayName,
+        airPlayEnabled     = this[Keys.AIRPLAY_ENABLED]         ?: AppSettings.DEFAULT.airPlayEnabled,
+        airPlayPinAuthEnabled = this[Keys.AIRPLAY_PIN_AUTH]     ?: AppSettings.DEFAULT.airPlayPinAuthEnabled,
+        startOnBoot        = this[Keys.START_ON_BOOT]           ?: AppSettings.DEFAULT.startOnBoot,
+        showDebugOverlay   = this[Keys.SHOW_DEBUG_OVERLAY]      ?: AppSettings.DEFAULT.showDebugOverlay,
+        forceHighResolution = this[Keys.FORCE_HIGH_RESOLUTION]  ?: AppSettings.DEFAULT.forceHighResolution,
+        mirrorAudioEnabled = this[Keys.MIRROR_AUDIO_ENABLED]    ?: AppSettings.DEFAULT.mirrorAudioEnabled
     )
 
     /**

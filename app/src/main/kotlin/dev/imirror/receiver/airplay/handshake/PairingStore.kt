@@ -1,6 +1,7 @@
 package dev.imirror.receiver.airplay.handshake
 
 import android.content.Context
+import java.security.MessageDigest
 
 /**
  * PairingStore — persists the long-term public keys (Ed25519 LTPK) of controllers that completed PIN
@@ -12,6 +13,8 @@ class PairingStore(context: Context) {
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     fun add(controllerId: String, ltpk: ByteArray) {
+        require(controllerId.isNotBlank() && controllerId.length <= 256)
+        require(ltpk.size == 32) { "Ed25519 controller keys must be 32 bytes" }
         prefs.edit().putString(KEY_PREFIX + controllerId, hex(ltpk)).apply()
     }
 
@@ -24,6 +27,12 @@ class PairingStore(context: Context) {
 
     /** True if any controller is paired (used to decide whether to require pairing at all). */
     fun hasAnyPairing(): Boolean = prefs.all.keys.any { it.startsWith(KEY_PREFIX) }
+
+    /** Raw AirPlay pair-verify supplies a public key, not the SRP controller identifier. */
+    fun containsPublicKey(publicKey: ByteArray): Boolean = publicKey.size == 32 && prefs.all.any { (key, value) ->
+        key.startsWith(KEY_PREFIX) && value is String &&
+            runCatching { MessageDigest.isEqual(unhex(value), publicKey) }.getOrDefault(false)
+    }
 
     // ─── Brute-force protection (HAP max-tries) ──────────────────────────────
     // A 4–8 digit PIN is low-entropy, so the real defence against guessing is bounding the number of

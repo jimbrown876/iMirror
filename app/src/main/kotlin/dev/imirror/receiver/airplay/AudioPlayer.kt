@@ -3,6 +3,7 @@ package dev.imirror.receiver.airplay
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.os.Build
 import dev.imirror.receiver.util.Logger
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -31,6 +32,8 @@ class AudioPlayer {
 
     // Android's audio output — writes decoded PCM audio to hardware
     private var audioTrack: AudioTrack? = null
+    private var pendingPcm: PcmWriteQueue? = null
+    private var volumeGain = 1f
 
     // RAOP audio is AES-128-CBC: whole 16-byte blocks per packet (fresh IV each packet), trailing
     // partial block in cleartext. Cipher reused; key/IV null for unencrypted streams.
@@ -71,6 +74,7 @@ class AudioPlayer {
      * @param codec      Audio codec from the SDP (ALAC is decoded in software; others pass through)
      * @param alacFramesPerPacket ALAC frameLength from the SDP fmtp (samples per packet)
      */
+    @Synchronized
     fun initialize(
         aesKey: ByteArray?, aesIv: ByteArray?, sampleRate: Int, channels: Int,
         codec: AudioCodec = AudioCodec.UNKNOWN, alacFramesPerPacket: Int = 352,
@@ -80,11 +84,7 @@ class AudioPlayer {
             return
         }
 
-        if (codec == AudioCodec.ALAC) {
-            alac = runCatching {
-                dev.imirror.receiver.airplay.handshake.AlacDecoder(sampleRate, channels, alacFramesPerPacket)
-            }.onFailure { Logger.e("AudioPlayer: ALAC decoder init failed", it) }.getOrNull()
-        }
+        require(sampleRate in 8000..192000 && channels in 1..2) { "Unsupported PCM format" }
 
         if (aesKey != null || aesIv != null) {
             // SECURITY: Validate key length before using for cryptography (RULE 4)
@@ -100,6 +100,11 @@ class AudioPlayer {
             Logger.i("Initializing AudioPlayer (unencrypted): ${sampleRate}Hz, $channels channels")
         }
 
+        if (codec == AudioCodec.ALAC) {
+            // Decoder failure must fail setup, never send compressed ALAC as loud PCM noise.
+            alac = dev.imirror.receiver.airplay.handshake.AlacDecoder(sampleRate, channels, alacFramesPerPacket)
+        }
+        pendingPcm = PcmWriteQueue(sampleRate * channels * 2 * 150 / 1000, channels * 2)
         initializeAudioTrack(sampleRate, channels)
 
         isInitialized = true
@@ -122,6 +127,7 @@ class AudioPlayer {
      *
      * @param rtpPacket The complete RTP packet bytes (header + encrypted payload)
      */
+    @Synchronized
     fun playAudioPacket(rtpPacket: ByteArray) {
         if (!isInitialized) {
             Logger.w("playAudioPacket() called but AudioPlayer not initialized")
@@ -131,14 +137,8 @@ class AudioPlayer {
         try {
             // Step 1: Strip the RTP header to get the encrypted audio payload
             // RTP header is always at least 12 bytes (RFC 3550)
-            if (rtpPacket.size <= RTP_HEADER_MIN_BYTES) {
-                Logger.w("RTP packet too small (${rtpPacket.size} bytes), skipping")
-                return
-            }
-            // Only decode audio (payload type 96). Skip timing/sync packets (e.g. 0xd4) that share the
-            // port — feeding them to the ALAC decoder produces errors and no audio.
-            if ((rtpPacket[1].toInt() and 0x7F) != AUDIO_PAYLOAD_TYPE) return
-            val encryptedPayload = rtpPacket.copyOfRange(RTP_HEADER_MIN_BYTES, rtpPacket.size)
+            val range = audioRtpPayloadRange(rtpPacket, 0, rtpPacket.size) ?: return
+            val encryptedPayload = rtpPacket.copyOfRange(range.first, range.last + 1)
 
             // Step 2: Decrypt if encrypted (cipher is null for unencrypted streams → pass-through)
             val decryptedPayload = decrypt(encryptedPayload)
@@ -155,7 +155,10 @@ class AudioPlayer {
 
             // Step 4: Write to AudioTrack for playback
             // WRITE_NON_BLOCKING returns immediately if the buffer is full (prevents stalls)
-            audioTrack?.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING)
+            val track = audioTrack ?: return
+            pendingPcm?.enqueueAndDrain(pcm) { bytes, offset, length ->
+                track.write(bytes, offset, length, AudioTrack.WRITE_NON_BLOCKING)
+            }
 
         } catch (e: Exception) {
             Logger.e("Error playing audio packet", e)
@@ -170,6 +173,7 @@ class AudioPlayer {
      *
      * RULE 5: All resources released — AudioTrack holds exclusive hardware audio output.
      */
+    @Synchronized
     fun release() {
         Logger.d("Releasing AudioPlayer")
         try {
@@ -181,6 +185,7 @@ class AudioPlayer {
             runCatching { alac?.close() }
             alac = null
             audioTrack = null
+            pendingPcm = null
             aesKeySpec = null
             aesIvSpec = null
             isInitialized = false
@@ -189,6 +194,14 @@ class AudioPlayer {
             decodeHealthDecided = false
             muted = false
         }
+    }
+
+    /** Retain sender volume even when SET_PARAMETER precedes audio output creation. */
+    @Synchronized
+    fun setVolume(airplayVolume: Float) {
+        if (!airplayVolume.isFinite()) return
+        volumeGain = airplayVolumeGain(airplayVolume)
+        audioTrack?.setVolume(volumeGain)
     }
 
     /**
@@ -235,8 +248,8 @@ class AudioPlayer {
             AudioFormat.ENCODING_PCM_16BIT
         )
 
-        // Use 2x the minimum buffer size for more stability
-        val bufferSize = minBufferSize * 2
+        require(minBufferSize > 0) { "AudioTrack rejected negotiated audio format: $minBufferSize" }
+        val bufferSize = minBufferSize
 
         audioTrack = AudioTrack.Builder()
             .setAudioAttributes(
@@ -254,8 +267,12 @@ class AudioPlayer {
             )
             .setBufferSizeInBytes(bufferSize)
             .setTransferMode(AudioTrack.MODE_STREAM)  // STREAM = for continuous audio
+            .apply {
+                if (Build.VERSION.SDK_INT >= 26) setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+            }
             .build()
 
+        audioTrack!!.setVolume(volumeGain)
         audioTrack!!.play()
         Logger.d("AudioTrack initialized: ${sampleRate}Hz, $channels ch, buffer=$bufferSize bytes")
     }
@@ -315,3 +332,61 @@ class AudioPlayer {
         private const val DECODE_HEALTH_MIN_RATE = 0.8
     }
 }
+
+/** Keeps short writes intact without allowing a slow output device to accumulate seconds of lag. */
+internal class PcmWriteQueue(private val capacity: Int, private val frameBytes: Int) {
+    private data class Chunk(val bytes: ByteArray, var offset: Int = 0)
+    private val chunks = java.util.ArrayDeque<Chunk>()
+    internal var pendingBytes = 0
+        private set
+
+    fun enqueueAndDrain(pcm: ByteArray, write: (ByteArray, Int, Int) -> Int) {
+        require(frameBytes > 0 && capacity >= frameBytes)
+        if (pcm.isNotEmpty()) {
+            require(pcm.size % frameBytes == 0) { "Incomplete PCM frame" }
+            chunks.add(Chunk(pcm))
+            pendingBytes += pcm.size
+        }
+        val alignedCapacity = capacity / frameBytes * frameBytes
+        while (pendingBytes > alignedCapacity) {
+            val chunk = chunks.first()
+            val skip = minOf(chunk.bytes.size - chunk.offset, pendingBytes - alignedCapacity)
+            chunk.offset += skip
+            pendingBytes -= skip
+            if (chunk.offset == chunk.bytes.size) chunks.removeFirst()
+        }
+        while (chunks.isNotEmpty()) {
+            val chunk = chunks.first()
+            val remaining = chunk.bytes.size - chunk.offset
+            val written = write(chunk.bytes, chunk.offset, remaining)
+            check(written in 0..remaining && written % frameBytes == 0) { "AudioTrack write failed: $written" }
+            if (written == 0) return
+            chunk.offset += written
+            pendingBytes -= written
+            if (chunk.offset == chunk.bytes.size) chunks.removeFirst()
+        }
+    }
+}
+
+/** RFC 3550 RTP payload bounds, including CSRCs, extension words and final padding. */
+internal fun audioRtpPayloadRange(data: ByteArray, offset: Int, length: Int): IntRange? {
+    if (offset < 0 || length <= 12 || offset > data.size - length) return null
+    val flags = data[offset].toInt() and 255
+    if (flags ushr 6 != 2 || data[offset + 1].toInt() and 0x7f != 96) return null
+    var start = offset + 12 + (flags and 15) * 4
+    val end = offset + length
+    if (start > end) return null
+    if (flags and 0x10 != 0) {
+        if (start + 4 > end) return null
+        val words = ((data[start + 2].toInt() and 255) shl 8) or (data[start + 3].toInt() and 255)
+        start += 4 + words * 4
+    }
+    val padding = if (flags and 0x20 != 0) data[end - 1].toInt() and 255 else 0
+    if (flags and 0x20 != 0 && padding == 0) return null
+    if (start >= end - padding) return null
+    return start until end - padding
+}
+
+/** AirPlay SET_PARAMETER volume is dB; AudioTrack takes linear amplitude, not slider percentage. */
+internal fun airplayVolumeGain(decibels: Float): Float =
+    if (decibels <= -144f) 0f else Math.pow(10.0, decibels.coerceIn(-30f, 0f).toDouble() / 20.0).toFloat()

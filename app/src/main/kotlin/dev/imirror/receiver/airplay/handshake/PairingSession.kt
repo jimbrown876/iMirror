@@ -20,7 +20,10 @@ import javax.crypto.spec.SecretKeySpec
  *
  * Reference: RPiPlay lib/pairing.c + lib/raop_handlers.h (pair-setup / pair-verify).
  */
-class PairingSession(private val keys: PairingKeys) {
+class PairingSession(
+    private val keys: PairingKeys,
+    private val isControllerTrusted: (ByteArray) -> Boolean = { true }
+) {
 
     private var ecdhOursPublic: ByteArray? = null
     private var ecdhTheirsPublic: ByteArray? = null
@@ -28,10 +31,13 @@ class PairingSession(private val keys: PairingKeys) {
 
     /** AES-128-CTR cipher spanning M1 (encrypt our sig, keystream 0..63) and M2 (decrypt theirs, 64..127). */
     private var verifyCipher: Cipher? = null
+    private var pendingSecret: ByteArray? = null
 
-    /** 32-byte X25519 shared secret, available after pair-verify M1. */
+    /** 32-byte X25519 shared secret, released only after the controller's M2 signature verifies. */
     var sharedSecret: ByteArray? = null
         private set
+
+    val isVerified: Boolean get() = sharedSecret != null
 
     /** POST /pair-setup → our 32-byte Ed25519 public key. */
     fun pairSetup(requestBody: ByteArray): ByteArray {
@@ -41,19 +47,27 @@ class PairingSession(private val keys: PairingKeys) {
 
     /** POST /pair-verify → dispatch on the leading state byte (1 = M1, 0 = M2). */
     fun pairVerify(body: ByteArray): ByteArray {
-        require(body.size >= 4) { "pair-verify body too short: ${body.size}" }
-        return when (body[0].toInt()) {
-            1 -> verifyM1(body)
-            0 -> verifyM2(body)
-            else -> throw IllegalArgumentException("unknown pair-verify state ${body[0].toInt()}")
+        try {
+            require(body.size >= 4) { "pair-verify body too short: ${body.size}" }
+            return when (body[0].toInt()) {
+                1 -> verifyM1(body)
+                0 -> verifyM2(body)
+                else -> throw IllegalArgumentException("unknown pair-verify state ${body[0].toInt()}")
+            }
+        } catch (e: Exception) {
+            clearVerification()
+            throw e
         }
     }
 
     private fun verifyM1(body: ByteArray): ByteArray {
+        clearVerification()
         require(body.size == 4 + 32 + 32) { "pair-verify M1 wrong size: ${body.size}" }
+        val theirEd = body.copyOfRange(36, 68)
+        if (!isControllerTrusted(theirEd)) throw SecurityException("controller has not PIN-paired")
         val theirEcdh = body.copyOfRange(4, 36)
         ecdhTheirsPublic = theirEcdh
-        edTheirsPublic = body.copyOfRange(36, 68)
+        edTheirsPublic = theirEd
 
         // Our ephemeral X25519 keypair + shared secret.
         val priv = X25519PrivateKeyParameters(SecureRandom())
@@ -62,7 +76,7 @@ class PairingSession(private val keys: PairingKeys) {
         val secret = ByteArray(32)
         X25519Agreement().apply { init(priv) }
             .calculateAgreement(X25519PublicKeyParameters(theirEcdh, 0), secret, 0)
-        sharedSecret = secret
+        pendingSecret = secret
 
         // Sign (ourPub ‖ theirPub) with our Ed25519 identity, then AES-CTR-encrypt the signature.
         val signature = keys.sign(ourPub + theirEcdh)          // 64 bytes
@@ -94,7 +108,21 @@ class PairingSession(private val keys: PairingKeys) {
             verifySignature(clientSig)
         }
         if (!ok) throw SecurityException("pair-verify signature mismatch")
+        sharedSecret = pendingSecret ?: error("missing pending pairing secret")
+        pendingSecret = null
+        verifyCipher = null // An M2 replay must not reuse a completed exchange.
         return ByteArray(0)                                    // success → empty 200 OK
+    }
+
+    private fun clearVerification() {
+        sharedSecret?.fill(0)
+        pendingSecret?.fill(0)
+        sharedSecret = null
+        pendingSecret = null
+        verifyCipher = null
+        ecdhOursPublic = null
+        ecdhTheirsPublic = null
+        edTheirsPublic = null
     }
 
     /** key/iv = SHA-512(salt ‖ ecdhSecret) truncated to 16 bytes. */

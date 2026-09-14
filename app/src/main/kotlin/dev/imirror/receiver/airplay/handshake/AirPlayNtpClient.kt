@@ -7,6 +7,8 @@ import kotlinx.coroutines.launch
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.Inet6Address
+import java.net.InetSocketAddress
 
 /**
  * AirPlayNtpClient — the receiver side of AirPlay 2 NTP timing.
@@ -27,7 +29,11 @@ class AirPlayNtpClient(
     private val remoteAddress: InetAddress,
     private val remoteTimingPort: Int,
 ) {
-    private val socket = DatagramSocket()      // OS-assigned local port
+    private val socket = DatagramSocket(null).apply {
+        val wildcard = if (remoteAddress is Inet6Address) "::" else "0.0.0.0"
+        bind(InetSocketAddress(InetAddress.getByName(wildcard), 0))
+        connect(remoteAddress, remoteTimingPort)
+    }
     @Volatile private var running = false
 
     /** Local UDP port to advertise to macOS as the receiver's timingPort. */
@@ -50,19 +56,22 @@ class AirPlayNtpClient(
         val request = ByteArray(32)
         request[0] = 0x80.toByte()
         request[1] = 0xD2.toByte()
-        request[3] = 0x07
+        var sequence = 0
         val response = ByteArray(128)
         var first = true
         var rxCount = 0
         while (running) {
             try {
                 putNtpTimestamp(request, 24, System.currentTimeMillis())
+                request[2] = (sequence ushr 8).toByte()
+                request[3] = sequence.toByte()
+                sequence = (sequence + 1) and 0xffff
                 socket.send(DatagramPacket(request, request.size, remoteAddress, remoteTimingPort))
                 if (first) { Logger.i("NTP: first timing request sent to macOS"); first = false }
                 try {
                     val rx = DatagramPacket(response, response.size)
                     socket.receive(rx)
-                    if (rxCount < 4) {
+                    if (rx.length >= 32 && response[1].toInt() and 0x7f == 0x53 && rxCount < 4) {
                         Logger.i("NTP RX[$rxCount] ${rx.length}B type=0x${(response[1].toInt() and 0xFF).toString(16)}: " +
                             (0 until minOf(rx.length, 32)).joinToString(" ") { "%02x".format(response[it]) })
                         rxCount++

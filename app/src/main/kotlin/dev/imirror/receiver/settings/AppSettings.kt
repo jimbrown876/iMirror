@@ -27,7 +27,7 @@ data class AppSettings(
      * If empty, the Android device name is used as a fallback.
      * Validated: max 63 characters, must not be blank after trimming.
      */
-    val displayName: String = "Pratik AirPlay",
+    val displayName: String = "",
 
     // ─── Protocols ─────────────────────────────────────────────────────────
     /**
@@ -71,10 +71,9 @@ data class AppSettings(
     val forceHighResolution: Boolean = false,
 
     /**
-     * When true, accept the mirroring audio stream (type 96, AAC-ELD). EXPERIMENTAL: macOS uses
-     * realtime audio clock-sync (RTCP) that isn't fully implemented yet, which can make macOS tear
-     * the whole mirror session down after a couple of seconds — so this defaults OFF to keep video
-     * mirroring rock-solid. Turn on to experiment with audio.
+     * Accept the realtime audio stream used by screen mirroring and Mac system sound.
+     * Keep enabled by default: macOS routes system sound to the mirrored TV, and rejecting
+     * that stream prevents browsers and music players from opening their audio renderer.
      */
     val mirrorAudioEnabled: Boolean = true
 ) {

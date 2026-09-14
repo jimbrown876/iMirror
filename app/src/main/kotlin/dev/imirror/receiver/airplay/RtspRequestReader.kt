@@ -2,6 +2,8 @@ package dev.imirror.receiver.airplay
 
 import dev.imirror.receiver.util.Logger
 import java.io.InputStream
+import java.util.Locale
+import java.util.TreeMap
 
 /**
  * RtspRequestReader parses RTSP/HTTP-style requests from the AirPlay control socket.
@@ -11,7 +13,8 @@ import java.io.InputStream
  */
 internal class RtspRequestReader(
     private val maxMessageBytes: Int,
-    private val maxPhotoBytes: Int
+    private val maxPhotoBytes: Int,
+    private val maxArtworkBytes: Int = 5 * 1024 * 1024
 ) {
     /**
      * Reads one complete RTSP or AirPlay photo request from [inputStream].
@@ -45,7 +48,8 @@ internal class RtspRequestReader(
     }
 
     private fun readHeaders(inputStream: InputStream, requestLineBytes: Int): Map<String, String>? {
-        val headers = mutableMapOf<String, String>()
+        // HTTP/RTSP field names are case-insensitive, including framing and MIME fields.
+        val headers = TreeMap<String, String>(String.CASE_INSENSITIVE_ORDER)
         var totalBytes = requestLineBytes
 
         while (true) {
@@ -60,8 +64,12 @@ internal class RtspRequestReader(
 
             val colonIndex = line.indexOf(':')
             if (colonIndex > 0) {
-                headers[line.substring(0, colonIndex).trim()] =
-                    line.substring(colonIndex + 1).trim()
+                val name = line.substring(0, colonIndex).trim()
+                if (name.equals("Content-Length", ignoreCase = true) && headers.containsKey(name)) {
+                    Logger.w("Duplicate Content-Length — rejecting ambiguous request framing")
+                    return null
+                }
+                headers[name] = line.substring(colonIndex + 1).trim()
             }
         }
     }
@@ -72,18 +80,31 @@ internal class RtspRequestReader(
         uri: String,
         headers: Map<String, String>
     ): ByteArray? {
-        val contentLength = headers["Content-Length"]?.toIntOrNull() ?: 0
-        val bodyLimit = if (method == "PUT" && uri.substringBefore("?") == PhotoHandler.PHOTO_PATH) {
-            maxPhotoBytes
-        } else {
-            maxMessageBytes
+        // AirPlay sends fixed-length bodies. Do not treat malformed lengths as empty or let an
+        // unsupported transfer encoding leave bytes to be mistaken for the next RTSP request.
+        if (headers.containsKey("Transfer-Encoding")) {
+            Logger.w("Unsupported Transfer-Encoding — rejecting request")
+            return null
+        }
+        val rawLength = headers["Content-Length"]
+        val contentLength = if (rawLength == null) 0 else {
+            if (rawLength.isEmpty() || rawLength.any { it !in '0'..'9' }) return null
+            rawLength.toIntOrNull() ?: return null
+        }
+        val contentType = headers["Content-Type"]?.substringBefore(';')?.trim()?.lowercase(Locale.ROOT)
+        val bodyLimit = when {
+            method == "PUT" && uri.substringBefore("?") == PhotoHandler.PHOTO_PATH -> maxPhotoBytes
+            // Album covers arrive during an existing audio session, not at the /photo endpoint.
+            // A typical ~95KB JPEG must not tear down music through the 64KB control-message cap.
+            method == "SET_PARAMETER" && contentType in setOf("image/jpeg", "image/png") -> maxArtworkBytes
+            else -> maxMessageBytes
         }
 
         if (contentLength > bodyLimit) {
             Logger.w("Request body too large ($contentLength bytes) — rejecting")
             return null
         }
-        if (contentLength <= 0) return ByteArray(0)
+        if (contentLength == 0) return ByteArray(0)
 
         val buf = ByteArray(contentLength)
         var read = 0
