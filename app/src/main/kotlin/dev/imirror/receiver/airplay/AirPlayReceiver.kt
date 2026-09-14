@@ -9,12 +9,17 @@ import dev.imirror.receiver.airplay.handshake.MirrorStreamServer
 import dev.imirror.receiver.service.ProtocolState
 import dev.imirror.receiver.util.Logger
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.ServerSocket
@@ -100,6 +105,9 @@ class AirPlayReceiver(
     // SupervisorJob: child coroutine failures don't propagate to siblings.
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + job)
+    private val legacyStartupLock = Any()
+    @Volatile private var legacyStartupGeneration = 0L
+    private var legacyStartupJob: Job? = null
 
     // Child components
     private var mdnsService: MdnsService? = null
@@ -171,6 +179,7 @@ class AirPlayReceiver(
      */
     fun stop() {
         Logger.i("AirPlayReceiver stopping")
+        invalidateLegacyStartup()
         try {
             rtspHandler?.stop()
             timingHandler?.stop()
@@ -266,25 +275,59 @@ class AirPlayReceiver(
         Logger.i("Streaming started — video=${session.hasVideo} audio=${session.hasAudio} " +
                  "audioOnly=${session.isAudioOnly}")
 
-        scope.launch {
+        val generation = synchronized(legacyStartupLock) {
+            legacyStartupJob?.cancel()
+            ++legacyStartupGeneration
+        }
+        val startup = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                if (session.hasVideo) startVideoDecoder(session)
-                if (session.hasAudio) startAudioPlayer(session)
-                // Legacy (SDP) session: reflect its stream kinds into now-playing state so an
-                // audio-only RAOP session shows the now-playing card.
-                npSenderName = session.senderName.ifBlank { npSenderName }
-                videoPlaying = session.hasVideo
-                audioPlaying = session.hasAudio
-                emitNowPlaying()
-                // Notify MirrorService of the sender name BEFORE emitting CONNECTED,
-                // so the name is ready when the ActiveConnection is created.
-                onSenderNameChanged(session.senderName)
-                emitState(ProtocolState.CONNECTED)
+                // Take over first: a background receiver has no Activity/Surface until CONNECTED.
+                // Awaiting this dispatch (rather than scheduling another child) preserves order.
+                withContext(Dispatchers.Main) {
+                    if (generation != legacyStartupGeneration) return@withContext
+                    npSenderName = session.senderName.ifBlank { npSenderName }
+                    videoPlaying = session.hasVideo
+                    audioPlaying = session.hasAudio
+                    emitNowPlaying()
+                    onSenderNameChanged(session.senderName)
+                    if (generation == legacyStartupGeneration) onStateChanged(ProtocolState.CONNECTED)
+                }
+                synchronized(legacyStartupLock) {
+                    if (generation != legacyStartupGeneration) return@launch
+                    // Audio-only playback never waits for a video output.
+                    if (session.hasAudio) startAudioPlayer(session)
+                }
+                if (session.hasVideo) {
+                    val surface = awaitValidOutput(
+                        provider = videoSurfaceProvider,
+                        valid = { it.isValid },
+                        current = { generation == legacyStartupGeneration }
+                    )
+                    synchronized(legacyStartupLock) {
+                        if (generation != legacyStartupGeneration) return@launch
+                        if (surface != null) startVideoDecoder(session, surface)
+                        else Logger.w("Legacy video: no valid surface after 5 seconds; audio/control remain available")
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Logger.e("Failed to start media pipeline", e)
-                emitState(ProtocolState.ERROR)
+                withContext(Dispatchers.Main) {
+                    if (generation == legacyStartupGeneration) onStateChanged(ProtocolState.ERROR)
+                }
             }
         }
+        synchronized(legacyStartupLock) {
+            if (generation == legacyStartupGeneration) legacyStartupJob = startup else startup.cancel()
+        }
+        startup.start()
+    }
+
+    private fun invalidateLegacyStartup() = synchronized(legacyStartupLock) {
+        legacyStartupGeneration++
+        legacyStartupJob?.cancel()
+        legacyStartupJob = null
     }
 
     /**
@@ -319,11 +362,8 @@ class AirPlayReceiver(
      * [RtspHandler.onVideoNalUnit] is wired here so RTP interleaved NAL units
      * flow directly into [VideoDecoder.decodeNalUnit].
      */
-    private fun startVideoDecoder(session: SessionDescription) {
-        val surface = videoSurfaceProvider() ?: run {
-            Logger.w("VideoDecoder: no surface available — skipping video pipeline")
-            return
-        }
+    private fun startVideoDecoder(session: SessionDescription, surface: Surface) {
+        if (!surface.isValid) return
         val sps = session.spsBytes ?: run {
             Logger.w("VideoDecoder: no SPS in SDP — skipping")
             return
@@ -333,6 +373,7 @@ class AirPlayReceiver(
             return
         }
 
+        videoDecoder?.release()
         videoDecoder = VideoDecoder(surface).also { decoder ->
             decoder.initialize(sps, pps, DEFAULT_VIDEO_WIDTH, DEFAULT_VIDEO_HEIGHT)
             rtspHandler?.onVideoNalUnit = { nalUnit, ptsUs ->
@@ -517,6 +558,7 @@ class AirPlayReceiver(
      * [AirPlayVideoPlayer], which fetches + plays it via MediaPlayer onto the same Surface.
      */
     private fun startUrlVideo(url: String, startFraction: Double) {
+        invalidateLegacyStartup()
         onSenderNameChanged("AirPlay")
         emitState(ProtocolState.CONNECTED)   // shows StreamingScreen → Surface becomes available
         val player = urlVideoPlayer ?: AirPlayVideoPlayer(
@@ -557,6 +599,7 @@ class AirPlayReceiver(
 
     /** Clears the video NAL callback, closes the audio socket, and releases media components. */
     private fun releaseMediaComponents() {
+        invalidateLegacyStartup()
         rtspHandler?.onVideoNalUnit = null
         try { audioSocket?.close() } catch (e: Exception) { /* non-fatal */ }
         audioSocket = null
@@ -643,4 +686,20 @@ class AirPlayReceiver(
 internal fun receiveAudioDatagram(socket: DatagramSocket, packet: DatagramPacket) {
     packet.length = packet.data.size - packet.offset
     socket.receive(packet)
+}
+
+/** A bounded, cancellable wait shared by legacy and URL video startup; no RTSP/main-thread sleeps. */
+internal suspend fun <T : Any> awaitValidOutput(
+    provider: () -> T?,
+    valid: (T) -> Boolean,
+    current: () -> Boolean,
+    timeoutMs: Long = 5_000,
+    pollMs: Long = 50
+): T? = withTimeoutOrNull(timeoutMs) {
+    require(pollMs > 0)
+    while (current()) {
+        provider()?.takeIf(valid)?.let { return@withTimeoutOrNull it }
+        delay(pollMs)
+    }
+    null
 }

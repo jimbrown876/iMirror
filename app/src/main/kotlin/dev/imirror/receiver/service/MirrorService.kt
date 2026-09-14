@@ -10,6 +10,10 @@ import android.content.Intent
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import androidx.core.app.NotificationCompat
 import dev.imirror.receiver.MainActivity
 import dev.imirror.receiver.R
@@ -27,6 +31,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * MirrorService — Android ForegroundService that hosts all receiver protocols.
@@ -55,6 +61,25 @@ class MirrorService : Service() {
     // Coroutine scope — cancelled in onDestroy() to clean up all coroutines
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
+    private val commandMutex = Mutex()
+    private val _presentationActive = MutableStateFlow(false)
+    val presentationActive: StateFlow<Boolean> = _presentationActive.asStateFlow()
+    private var presentationVisible = false
+    private var ownsAudioFocus = false
+    private var focusRequest: AudioFocusRequest? = null
+    private var playbackWakeLock: PowerManager.WakeLock? = null
+    private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+    private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+        if (change == AudioManager.AUDIOFOCUS_LOSS ||
+            change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
+            change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
+            // A user-selected TV app wins. Close the sender's transport, but keep listening.
+            if (ownsAudioFocus) {
+                Logger.i("AirPlay lost audio focus — ending playback, retaining listener")
+                serviceScope.launch { commandMutex.withLock { restartReceivers() } }
+            }
+        }
+    }
 
     // Observable state — Activities and Fragments observe this via the binder
     private val _serviceState = MutableStateFlow<ServiceState>(ServiceState.Stopped)
@@ -101,11 +126,14 @@ class MirrorService : Service() {
         // Promote to foreground immediately with a persistent notification
         startForeground(NOTIFICATION_ID, buildNotification(isRunning = false))
 
-        when (intent?.action) {
-            ACTION_START   -> serviceScope.launch { startReceivers() }
-            ACTION_STOP    -> serviceScope.launch { stopReceivers(); stopSelf() }
-            ACTION_RESTART -> serviceScope.launch { restartReceivers() }
-            else           -> serviceScope.launch { startReceivers() } // default: start
+        serviceScope.launch {
+            commandMutex.withLock {
+                when (intent?.action) {
+                    ACTION_STOP -> { stopReceivers(); stopSelf() }
+                    ACTION_RESTART -> restartReceivers()
+                    else -> startReceivers()
+                }
+            }
         }
 
         // START_STICKY: if the system kills the service, restart it with a null intent
@@ -114,16 +142,91 @@ class MirrorService : Service() {
 
     override fun onBind(intent: Intent?): IBinder = binder
 
-    /**
-     * The app was swiped away from recents. Cleanly stop all receivers (which closes the RTSP
-     * connection so an active mirror ends on the sender too) and stop the service — don't let
-     * START_STICKY silently resurrect it as a zombie that keeps advertising/streaming invisibly.
-     */
+    /** Closing the UI is not the notification's explicit Stop command. */
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Logger.i("App task removed — stopping receivers + service")
-        stopReceivers()
-        stopSelf()
+        Logger.i("App task removed — background AirPlay listener remains available")
         super.onTaskRemoved(rootIntent)
+    }
+
+    fun setPresentationVisible(visible: Boolean) {
+        presentationVisible = visible
+    }
+
+    /** Main-thread session edge, not a discovery probe, owns the temporary TV takeover. */
+    private fun reconcilePresentation() {
+        serviceScope.launch(Dispatchers.Main.immediate) {
+            val active = _airPlayState.value == ProtocolState.CONNECTED ||
+                _photoFrame.value != null || _pairingPin.value != null
+            val wasActive = _presentationActive.value
+            _presentationActive.value = active
+            if (active && (_airPlayState.value == ProtocolState.CONNECTED || _photoFrame.value != null)) {
+                if (!acquirePlaybackFocus()) {
+                    Logger.w("AirPlay audio focus denied — closing playback without taking over")
+                    serviceScope.launch { commandMutex.withLock { restartReceivers() } }
+                    return@launch
+                }
+            }
+            if (active && !wasActive && !presentationVisible) {
+                try {
+                    startActivity(Intent(this@MirrorService, MainActivity::class.java).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                        putExtra(MainActivity.EXTRA_RETURN_AFTER_PLAYBACK, true)
+                    })
+                    Logger.i("AirPlay takeover requested")
+                } catch (e: Exception) {
+                    Logger.e("Unable to open AirPlay playback screen", e)
+                }
+            }
+            if (!active) releasePlaybackFocus()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    @Synchronized
+    private fun acquirePlaybackFocus(): Boolean {
+        if (ownsAudioFocus) return true
+        // AirPlay temporarily interrupts the existing TV session; abandoning transient
+        // focus lets its owner resume according to that app's own playback policy.
+        val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                .setOnAudioFocusChangeListener(focusListener, android.os.Handler(mainLooper))
+                .setWillPauseWhenDucked(true)
+                .build()
+            focusRequest = request
+            audioManager.requestAudioFocus(request)
+        } else audioManager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC,
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+        ownsAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        if (ownsAudioFocus) {
+            playbackWakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "iMirror:playback").apply {
+                    setReferenceCounted(false)
+                    // Cover the foreground handoff; the visible playback window keeps the
+                    // screen/CPU awake afterwards. Bound recovery if a lifecycle callback is lost.
+                    acquire(10 * 60 * 1000L)
+                }
+            Logger.i("AirPlay acquired temporary audio focus")
+        }
+        return ownsAudioFocus
+    }
+
+    @Suppress("DEPRECATION")
+    @Synchronized
+    private fun releasePlaybackFocus() {
+        val heldFocus = ownsAudioFocus
+        ownsAudioFocus = false
+        if (heldFocus) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+            } else audioManager.abandonAudioFocus(focusListener)
+            Logger.i("AirPlay released audio focus to previous TV app")
+        }
+        focusRequest = null
+        playbackWakeLock?.let { if (it.isHeld) it.release() }
+        playbackWakeLock = null
     }
 
     /**
@@ -251,15 +354,18 @@ class MirrorService : Service() {
                     mimeType = imageType.mimeType
                 )
                 updateNotification(isRunning = true)
+                reconcilePresentation()
             },
             onPhotoCleared = {
                 _photoFrame.value = null
+                reconcilePresentation()
             },
             onNowPlayingChanged = { info ->
                 _nowPlaying.value = info
             },
             onPinChanged = { pin ->
                 _pairingPin.value = pin
+                reconcilePresentation()
             },
             onStateChanged = { state ->
                 _airPlayState.value = state
@@ -278,6 +384,7 @@ class MirrorService : Service() {
                                                        state != ProtocolState.ERROR)
                     }
                 }
+                reconcilePresentation()
             }
         ).also { it.start() }
         Logger.d("AirPlay receiver started (displayName='${settings.effectiveDisplayName}')")
@@ -290,6 +397,8 @@ class MirrorService : Service() {
         _photoFrame.value = null
         _nowPlaying.value = null
         _pairingPin.value = null
+        _presentationActive.value = false
+        releasePlaybackFocus()
     }
 
     // ─── Notification ────────────────────────────────────────────────────────
