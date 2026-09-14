@@ -4,7 +4,20 @@ This GPL-3.0 personal fork retains upstream attribution and is based on
 `prat3ik/iMirror` main commit `9b52ce6d8bedb80ee557a5114d3cdbee4ab84f00`.
 It is not an Apple-certified receiver. No DRM bypass or paid service is included.
 
-## Current personal build: 1.0.3-personal (version code 4)
+## Current personal build: 1.0.4-personal (version code 5)
+
+- Keep accepting control connections while a sender is active, reject probes during
+  real media flow, and replace an abandoned Wi-Fi session after a bounded idle window.
+- Reclaim a vanished sender automatically without imposing a fixed timeout on healthy
+  audio/video traffic whose RTSP control channel is quiet.
+- Run teardown once and keep the existing mDNS advertisements instead of repeatedly
+  unregistering and re-registering them after discovery probes or duplicate teardown.
+- Ignore late advertising callbacks while media is active so an older callback cannot
+  release the new session's temporary audio focus or send the TV back to its prior app.
+- Give audio-only music a modest weak-Wi-Fi burst cushion while leaving the interactive
+  mirroring queue at its existing low-latency budget.
+
+The version 1.0.3 background-listening repairs below are retained:
 
 - Listen in a foreground service after leaving/removing the app task.
 - Restore the listener after boot and package replacement; migrate the existing
@@ -76,8 +89,10 @@ followed by volume, repeated controls, bounded decoding and UDP packet reuse.
 still required; unit tests do not prove audible playback.** Compatibility varies
 by sender OS, codec and content provider.
 
-Software audio queue budgets are approximately 140 ms on the realtime path, not
-measured end-to-end latency. The TCL hardware reports a roughly 144 ms minimum
+Software audio queue budgets are approximately 140 ms on the realtime mirroring
+path and no more than roughly 225 ms for audio-only music burst recovery, not
+measured end-to-end latency. Neither path forces the queue to prefill, so healthy
+steady-state playback does not inherit that full capacity. The TCL hardware reports a roughly 144 ms minimum
 AudioTrack buffer and declines Android's FAST flag. Sender buffering, network,
 decoding, and hardware output add delay; no total-latency guarantee is made.
 
