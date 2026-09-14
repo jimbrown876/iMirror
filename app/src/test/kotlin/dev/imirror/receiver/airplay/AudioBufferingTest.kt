@@ -66,13 +66,21 @@ class AudioBufferingTest {
     }
 
     @Test
-    fun `queue plus gap allowance remains below 150ms for negotiated music codecs`() {
+    fun `mirroring remains below 150ms while music gets bounded weak wifi headroom`() {
         for (rate in listOf(44100, 48000)) {
             for (samples in listOf(352, 480, 1024)) {
-                val queue = AudioStreamServer.packetBudget(rate, samples, 100)
-                val reorder = AudioStreamServer.packetBudget(rate, samples, 40)
-                assertTrue((queue + reorder).toDouble() * samples * 1000 / rate <= 150)
-                assertTrue(queue > 0 && reorder > 0)
+                val mirrorQueue = AudioStreamServer.packetBudget(rate, samples,
+                    AudioStreamServer.queueBudgetMillis(AudioStreamServer.CT_AAC_ELD))
+                val mirrorReorder = AudioStreamServer.packetBudget(rate, samples,
+                    AudioStreamServer.reorderBudgetMillis(AudioStreamServer.CT_AAC_ELD))
+                assertTrue((mirrorQueue + mirrorReorder).toDouble() * samples * 1000 / rate <= 150)
+
+                val musicQueue = AudioStreamServer.packetBudget(rate, samples,
+                    AudioStreamServer.queueBudgetMillis(AudioStreamServer.CT_ALAC))
+                val musicReorder = AudioStreamServer.packetBudget(rate, samples,
+                    AudioStreamServer.reorderBudgetMillis(AudioStreamServer.CT_ALAC))
+                assertTrue((musicQueue + musicReorder).toDouble() * samples * 1000 / rate <= 225)
+                assertTrue(musicQueue >= mirrorQueue && musicReorder >= mirrorReorder)
             }
         }
     }

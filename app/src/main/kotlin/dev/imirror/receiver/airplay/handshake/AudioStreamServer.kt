@@ -78,8 +78,13 @@ class AudioStreamServer(
     // the playback thread. Bounded so a stalled player can't grow latency unboundedly — if it fills
     // we drop the oldest frame (a brief glitch is better than ever-growing audio lag).
     private val packetFrames = when (codecType) { CT_AAC_ELD -> 480; CT_AAC_LC -> 1024; else -> framesPerPacket }
-    private val frameQueue = ArrayBlockingQueue<ByteArray>(packetBudget(sampleRate, packetFrames, 100))
-    private val reorderHold = packetBudget(sampleRate, packetFrames, 40)
+    // Mirroring retains the original tight budget. Music-only streams get another ~120 ms of
+    // burst tolerance because these TCL radios can fall below -70 dBm; capacity is a ceiling, not
+    // forced prebuffer, so a healthy connection keeps the same steady-state latency.
+    private val frameQueue = ArrayBlockingQueue<ByteArray>(
+        packetBudget(sampleRate, packetFrames, queueBudgetMillis(codecType))
+    )
+    private val reorderHold = packetBudget(sampleRate, packetFrames, reorderBudgetMillis(codecType))
     private var decodedSamples = 0L
 
     // RTP duplicate suppression. macOS sends each realtime-audio packet 2–3× for redundancy
@@ -205,6 +210,7 @@ class AudioStreamServer(
      */
     private fun handleRtpPacket(src: ByteArray, offset: Int, length: Int) {
         val range = audioRtpPayloadRange(src, offset, length) ?: return
+        StreamStats.markMediaPacket()
         val seq = ((src[offset + 2].toInt() and 0xFF) shl 8) or (src[offset + 3].toInt() and 0xFF)
         // RAOP RTP: 12-byte header, then AES-128-CBC-encrypted audio payload (copied out of src).
         val payload = src.copyOfRange(range.first, range.last + 1)
@@ -466,6 +472,12 @@ class AudioStreamServer(
             require(sampleRate > 0 && frames > 0 && milliseconds > 0)
             return (sampleRate.toLong() * milliseconds / (frames.toLong() * 1000)).toInt().coerceIn(1, 32)
         }
+
+        internal fun queueBudgetMillis(codecType: Int): Int =
+            if (codecType == CT_AAC_ELD) 100 else 160
+
+        internal fun reorderBudgetMillis(codecType: Int): Int =
+            if (codecType == CT_AAC_ELD) 40 else 60
 
         // Sliding window of recently-played RTP sequence numbers for duplicate suppression.
         // ~11 s at 92 packets/s — far longer than any retransmit gap, far shorter than the

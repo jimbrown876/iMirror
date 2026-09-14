@@ -24,6 +24,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * AirPlayReceiver — Top-level orchestrator for the AirPlay 2 receiver pipeline.
@@ -108,6 +109,7 @@ class AirPlayReceiver(
     private val legacyStartupLock = Any()
     @Volatile private var legacyStartupGeneration = 0L
     private var legacyStartupJob: Job? = null
+    private val mediaSession = MediaSessionGate()
 
     // Child components
     private var mdnsService: MdnsService? = null
@@ -179,6 +181,7 @@ class AirPlayReceiver(
      */
     fun stop() {
         Logger.i("AirPlayReceiver stopping")
+        mediaSession.reset()
         invalidateLegacyStartup()
         try {
             rtspHandler?.stop()
@@ -213,7 +216,15 @@ class AirPlayReceiver(
     private fun startMdnsService() {
         mdnsService = MdnsService(
             context = context,
-            onStateChange = { state -> emitState(state) },
+            onStateChange = { state ->
+                // NSD registration callbacks can arrive after playback has already connected.
+                // Never let that stale ADVERTISING edge dismiss the playback UI or its audio focus.
+                if (!mediaSession.shouldPublish(state)) {
+                    Logger.d("Ignoring late mDNS ADVERTISING state during active playback")
+                } else {
+                    emitState(state)
+                }
+            },
             onActualNameRegistered = { actualName -> onActualNameRegistered(actualName) }
         ).also { it.start(displayName.ifBlank { null }) }
         Logger.d("mDNS service started")
@@ -226,11 +237,18 @@ class AirPlayReceiver(
             displayHeight = mirrorHeight,
             audioEnabled = audioEnabled,
             videoSurfaceProvider = videoSurfaceProvider,
-            onStreamingStarted = { session -> onStreamingStarted(session) },
+            onStreamingStarted = { session ->
+                mediaSession.activate()
+                onStreamingStarted(session)
+            },
             onStreamingStopped = { onStreamingStopped() },
-            onPhotoReceived = { bytes, imageType -> onPhotoReceived(bytes, imageType) },
+            onPhotoReceived = { bytes, imageType ->
+                mediaSession.activate()
+                onPhotoReceived(bytes, imageType)
+            },
             onPhotoCleared = { onPhotoCleared() },
             onMirrorSetupKeys = { aesKey, ecdhSecret, aesIv, remoteAddr, senderTimingPort ->
+                mediaSession.activate()
                 startMirrorKeys(aesKey, ecdhSecret, aesIv, remoteAddr, senderTimingPort)
             },
             onMirrorStreamStart = { streamConnectionId -> startMirrorStream(streamConnectionId) },
@@ -248,7 +266,10 @@ class AirPlayReceiver(
                 npArtwork = bytes.takeIf { it.isNotEmpty() }
                 emitNowPlaying()
             },
-            onVideoPlay = { url, start -> startUrlVideo(url, start) },
+            onVideoPlay = { url, start ->
+                mediaSession.activate()
+                startUrlVideo(url, start)
+            },
             onVideoRate = { rate -> urlVideoPlayer?.setRate(rate) },
             onVideoScrub = { pos -> urlVideoPlayer?.scrub(pos) },
             onVideoStop = { stopUrlVideo() },
@@ -256,7 +277,8 @@ class AirPlayReceiver(
             onRemoteControlInfo = { dacpId, activeRemote -> dacpClient.configure(dacpId, activeRemote) },
             pinAuthEnabled = pinAuthEnabled,
             pairingStore = pairingStore,
-            onShowPin = { pin -> onPinChanged(pin) }
+            onShowPin = { pin -> onPinChanged(pin) },
+            hasRecentMediaActivity = { StreamStats.hasRecentMediaPacket(5_000L) }
         ).also { it.start(scope) }
         Logger.i("RTSP handler started on port 7000 (audioEnabled=$audioEnabled pinAuth=$pinAuthEnabled)")
     }
@@ -337,17 +359,13 @@ class AirPlayReceiver(
      * in sender pickers immediately.
      */
     private fun onStreamingStopped() {
+        if (!mediaSession.endOnce()) {
+            Logger.d("Ignoring duplicate or discovery-only AirPlay disconnect")
+            return
+        }
         Logger.i("Streaming stopped — releasing media components")
         releaseMediaComponents()
         emitState(ProtocolState.ADVERTISING)
-
-        scope.launch {
-            try {
-                mdnsService?.restart(displayName.ifBlank { null })
-            } catch (e: Exception) {
-                Logger.e("Failed to restart mDNS after streaming", e)
-            }
-        }
     }
 
     // ─── Private: media pipeline ──────────────────────────────────────────────
@@ -447,6 +465,7 @@ class AirPlayReceiver(
 
                 while (isActive && audioSocket === socket && !socket.isClosed) {
                     receiveAudioDatagram(socket, packet)
+                    StreamStats.markMediaPacket()
                     // copyOf trims to actual packet length before passing to the player
                     player.playAudioPacket(packet.data.copyOf(packet.length))
                 }
@@ -630,6 +649,7 @@ class AirPlayReceiver(
         videoDecoder = null
         audioPlayer?.release()
         audioPlayer = null
+        StreamStats.resetStreams()
         // Session fully torn down — clear now-playing so the UI leaves the audio card.
         audioPlaying = false
         videoPlaying = false
@@ -702,4 +722,15 @@ internal suspend fun <T : Any> awaitValidOutput(
         delay(pollMs)
     }
     null
+}
+
+/** Serializes the visible media lifecycle across duplicated RTSP and asynchronous NSD callbacks. */
+internal class MediaSessionGate {
+    private val active = AtomicBoolean(false)
+
+    fun activate() { active.set(true) }
+    fun reset() { active.set(false) }
+    fun endOnce(): Boolean = active.compareAndSet(true, false)
+    fun shouldPublish(state: ProtocolState): Boolean =
+        state != ProtocolState.ADVERTISING || !active.get()
 }
