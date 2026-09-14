@@ -106,7 +106,8 @@ class AirPlayReceiver(
     private var rtspHandler: RtspHandler? = null
     private var timingHandler: TimingHandler? = null
     private var videoDecoder: VideoDecoder? = null
-    private var audioPlayer: AudioPlayer? = null
+    @Volatile private var audioPlayer: AudioPlayer? = null
+    @Volatile private var senderVolumeDb = 0f
 
     // UDP socket for receiving audio RTP packets — opened after RECORD, closed on TEARDOWN
     @Volatile private var audioSocket: DatagramSocket? = null
@@ -229,7 +230,7 @@ class AirPlayReceiver(
             onMirrorVideoStop = { stopMirrorVideo() },
             onBufferedAudioStart = { startBufferedAudio() },
             onBufferedAudioStop = { stopBufferedAudio() },
-            onVolume = { v -> audioServer?.setVolume(v) },
+            onVolume = { v -> updateAudioVolume(v) },
             onNowPlayingMetadata = { title, artist, album ->
                 npTitle = title; npArtist = artist; npAlbum = album
                 emitNowPlaying()
@@ -349,7 +350,13 @@ class AirPlayReceiver(
      * This prevents a zero-key cipher from producing garbage audio (S6-4 fix).
      */
     private fun startAudioPlayer(session: SessionDescription) {
-        audioPlayer = AudioPlayer().also { player ->
+        audioSocket?.close()
+        audioSocket = null
+        audioPlayer?.release()
+        val player = AudioPlayer()
+        audioPlayer = player
+        player.setVolume(senderVolumeDb)
+        try {
             player.initialize(
                 aesKey     = session.aesKey.takeIf { session.isAudioEncrypted },
                 aesIv      = session.aesIv.takeIf  { session.isAudioEncrypted },
@@ -358,11 +365,22 @@ class AirPlayReceiver(
                 codec      = session.audioCodec,
                 alacFramesPerPacket = session.alacFramesPerPacket
             )
+        } catch (e: Exception) {
+            player.release()
+            if (audioPlayer === player) audioPlayer = null
+            throw e
         }
         Logger.i("AudioPlayer started (${session.sampleRate}Hz × ${session.channels}ch, " +
                  "codec=${session.audioCodec}, encrypted=${session.isAudioEncrypted})")
 
-        startAudioUdpReceiver()
+        startAudioUdpReceiver(player)
+    }
+
+    private fun updateAudioVolume(volume: Float) {
+        if (!volume.isFinite()) return
+        senderVolumeDb = volume
+        audioPlayer?.setVolume(volume)
+        audioServer?.setVolume(volume)
     }
 
     /**
@@ -375,28 +393,32 @@ class AirPlayReceiver(
      *
      * The socket is closed in [releaseMediaComponents] when streaming ends.
      */
-    private fun startAudioUdpReceiver() {
+    private fun startAudioUdpReceiver(player: AudioPlayer) {
+        // Bind before launching so a later teardown cannot be overtaken by delayed socket setup.
+        val socket = DatagramSocket(AUDIO_RTP_PORT)
+        audioSocket = socket
         scope.launch(Dispatchers.IO) {
             try {
-                val socket = DatagramSocket(AUDIO_RTP_PORT)
-                audioSocket = socket
                 Logger.i("Audio UDP receiver listening on port $AUDIO_RTP_PORT")
 
                 val buf    = ByteArray(MAX_AUDIO_PACKET_BYTES)
                 val packet = DatagramPacket(buf, buf.size)
 
-                while (isActive) {
-                    socket.receive(packet)
+                while (isActive && audioSocket === socket && !socket.isClosed) {
+                    receiveAudioDatagram(socket, packet)
                     // copyOf trims to actual packet length before passing to the player
-                    audioPlayer?.playAudioPacket(packet.data.copyOf(packet.length))
+                    player.playAudioPacket(packet.data.copyOf(packet.length))
                 }
             } catch (e: Exception) {
                 // SocketException thrown when audioSocket.close() is called — expected
-                if (audioSocket != null) {
+                if (!socket.isClosed && audioSocket === socket) {
                     Logger.e("Audio UDP receiver error (unexpected)", e)
                 } else {
                     Logger.d("Audio socket closed (expected during shutdown)")
                 }
+            } finally {
+                socket.close()
+                if (audioSocket === socket) audioSocket = null
             }
         }
     }
@@ -464,7 +486,7 @@ class AirPlayReceiver(
         val ecdhSecret = mirrorEcdhSecret ?: return 0 to 0
         val aesIv = mirrorAesIv ?: return 0 to 0
         val server = AudioStreamServer(aesKey, ecdhSecret, aesIv, sampleRate, channels, codecType, framesPerPacket)
-            .also { audioServer = it; it.start(scope) }
+            .also { audioServer = it; it.setVolume(senderVolumeDb); it.start(scope) }
         audioPlaying = true
         emitNowPlaying()
         Logger.i("Mirror audio server started: dataPort=${server.dataPort} controlPort=${server.controlPort}")
@@ -615,4 +637,10 @@ class AirPlayReceiver(
          */
         private const val MAX_AUDIO_PACKET_BYTES = 16 * 1024
     }
+}
+
+/** receive() replaces length with the received size; restore capacity before reusing the packet. */
+internal fun receiveAudioDatagram(socket: DatagramSocket, packet: DatagramPacket) {
+    packet.length = packet.data.size - packet.offset
+    socket.receive(packet)
 }

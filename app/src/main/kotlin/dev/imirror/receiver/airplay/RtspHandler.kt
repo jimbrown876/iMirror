@@ -69,7 +69,7 @@ open class RtspHandler(
     private val onPlaybackInfo: () -> dev.imirror.receiver.airplay.PlaybackInfo? = { null },
     /** Sender's DACP reverse-control identity from RTSP headers (DACP-ID + Active-Remote token). */
     private val onRemoteControlInfo: (dacpId: String?, activeRemote: String?) -> Unit = { _, _ -> },
-    /** When true, require HomeKit-style SRP PIN pairing before streaming (gated by AppSettings). */
+    /** When true, require legacy SRP PIN pairing and a verified controller signature before streaming. */
     private val pinAuthEnabled: Boolean = false,
     /** Persistent store of paired controllers' Ed25519 keys (for pair-verify). */
     private val pairingStore: dev.imirror.receiver.airplay.handshake.PairingStore? = null,
@@ -79,10 +79,11 @@ open class RtspHandler(
 
     // ─── Legacy AirPlay SRP PIN pairing (only used when pinAuthEnabled) ───────
     @Volatile private var legacyPin: dev.imirror.receiver.airplay.handshake.LegacyPairSetupPin? = null
-    // True once a controller has completed SRP PIN pairing. Until then, with PIN auth on, we reject
-    // pair-verify — which is what makes macOS fall back to the /pair-pin-start + /pair-setup-pin PIN
-    // flow (an accepted pair-verify means "already trusted, no PIN needed").
-    @Volatile private var pinPaired = false
+    private var legacyPinAddress: java.net.InetAddress? = null
+    private var legacyPinStartedNanos: Long = 0
+    // Preserve only the unfinished SRP exchange across macOS TCP reconnects. Authorization is
+    // always proven with the stored controller key and a fresh pair-verify signature per socket.
+    private val controllerStore by lazy { pairingStore ?: dev.imirror.receiver.airplay.handshake.PairingStore(context) }
 
     /** Last volume the sender set (AirPlay dB); returned to GET_PARAMETER volume queries. */
     @Volatile private var currentVolume: Float = 0f
@@ -154,6 +155,7 @@ open class RtspHandler(
         }
         activeClient = null
         serverSocket = null
+        clearPendingPin()
         Logger.i("RTSP handler stopped")
     }
 
@@ -211,16 +213,17 @@ open class RtspHandler(
     }
 
     private fun handleClient(socket: Socket) {
+        socket.soTimeout = HANDSHAKE_IDLE_TIMEOUT_MS
         val inputStream = socket.getInputStream()
         val outputStream = socket.getOutputStream()
 
         // Fresh pairing + FairPlay state for each control connection.
-        pairingSession = PairingSession(PairingKeys.get(context))
+        pairingSession = PairingSession(PairingKeys.get(context)) { key ->
+            !pinAuthEnabled || controllerStore.containsPublicKey(key)
+        }
         fairPlay = FairPlay()
-        // NOTE: legacyPin and pinPaired are deliberately NOT reset here. macOS runs the PIN handshake
-        // across SEPARATE TCP connections (/pair-pin-start on one, /pair-setup-pin on the next), so the
-        // PIN/verifier and the "paired" flag must survive a reconnect. They live for the receiver's
-        // lifetime — replaced by the next /pair-pin-start, set on a successful pairing.
+        // macOS may finish the PIN exchange on a new socket. The pending exchange has an owner and
+        // expiry, while this connection starts unverified regardless of any previous pairing.
         currentRemoteAddress = socket.inetAddress
 
         try {
@@ -229,6 +232,11 @@ open class RtspHandler(
                 currentCSeq = request.headers["CSeq"]?.toIntOrNull() ?: 0
                 val response = routeRequest(request)
                 sendResponse(outputStream, response)
+                // Established media streams can keep control quiet for long periods. Apply the
+                // timeout only to discovery/pairing sockets that have not established a session.
+                if (establishesControlSession(request, response)) {
+                    socket.soTimeout = 0
+                }
 
                 // After RECORD on a legacy SDP session: a session WITH video switches to interleaved
                 // RTP (video arrives $-framed over this TCP socket). An audio-only session (e.g. Apple
@@ -261,6 +269,7 @@ open class RtspHandler(
             socket.close()
             activeClient = null
             currentSession = null
+            currentRemoteAddress = null
             pairingSession = null
             fairPlay = null
             isMirrorSession = false
@@ -270,11 +279,27 @@ open class RtspHandler(
         }
     }
 
-    private fun routeRequest(request: RtspRequest): RtspResponse {
+    /** Quiet, verified or accepted legacy media sessions must not inherit the handshake timeout. */
+    internal fun establishesControlSession(request: RtspRequest, response: RtspResponse): Boolean {
+        if (response.statusCode != 200) return false
+        if (pairingSession?.isVerified == true || currentSession != null || activeStreamTypes.isNotEmpty()) return true
+        val path = request.uri.substringBefore("?")
+        return (request.method == "POST" && path == "/play") ||
+            (request.method == "PUT" && path == "/photo")
+    }
+
+    internal fun routeRequest(request: RtspRequest): RtspResponse {
         Logger.d("RTSP ${request.method} ${request.uri}")
+        // Gate every playback/control entry point, including legacy ANNOUNCE, photo PUT and URL
+        // playback. Merely knowing a paired public key or completing pair-verify M1 is insufficient.
+        if (pinAuthEnabled && pairingSession?.isVerified != true && !isPairingOrDiscovery(request)) {
+            return RtspResponse(470, "Connection Authorization Required", protocol = request.responseProtocol())
+        }
         // Senders attach their DACP reverse-control identity to most requests — capture it so the TV
         // remote can drive playback (DacpClient dedups, so this is cheap to call repeatedly).
-        request.headers["Active-Remote"]?.let { onRemoteControlInfo(request.headers["DACP-ID"], it) }
+        if (!pinAuthEnabled || pairingSession?.isVerified == true) {
+            request.headers["Active-Remote"]?.let { onRemoteControlInfo(request.headers["DACP-ID"], it) }
+        }
         return when (request.method) {
             "OPTIONS"       -> handleOptionsInternal(request)
             "ANNOUNCE"      -> handleAnnounceInternal(request)
@@ -298,6 +323,15 @@ open class RtspHandler(
             "POST"          -> routePost(request)
             else            -> handleUnknownInternal(request)
         }
+    }
+
+    private fun isPairingOrDiscovery(request: RtspRequest): Boolean = when (request.method) {
+        "OPTIONS" -> true
+        "GET" -> request.uri.substringBefore("?") in setOf("/info", "/server-info")
+        "POST" -> request.uri.substringBefore("?") in setOf(
+            "/pair-setup", "/pair-pin-start", "/pair-setup-pin", "/pair-verify"
+        )
+        else -> false
     }
 
     /** Routes AirPlay 2 GET requests by URI path. */
@@ -421,7 +455,7 @@ open class RtspHandler(
     /** GET /server-info — legacy XML plist of receiver identity for AirPlay video senders. */
     private fun handleServerInfo(request: RtspRequest): RtspResponse {
         val info = mapOf(
-            "deviceid" to dev.imirror.receiver.util.NetworkUtils.getMacAddress(),
+            "deviceid" to dev.imirror.receiver.util.NetworkUtils.getMacAddress(context),
             "features" to 0x1E5A7FFFF7L,
             "model" to "AppleTV5,3",
             "protovers" to "1.1",
@@ -482,9 +516,8 @@ open class RtspHandler(
     )
 
     /**
-     * POST /pair-setup. With PIN auth off (default) this is the anonymous Ed25519 exchange. With PIN
-     * auth on, it runs the HomeKit-style SRP pair-setup (TLV8) — showing a PIN on the TV that the
-     * user types on the Mac — so only someone with screen access can pair.
+     * POST /pair-setup returns the accessory's public identity. PIN enrollment is the separate
+     * legacy SRP /pair-setup-pin exchange; controller trust is enforced by pair-verify.
      */
     private fun handlePairSetup(request: RtspRequest): RtspResponse {
         // /pair-setup is the anonymous key exchange; PIN access control runs on /pair-setup-pin.
@@ -504,13 +537,9 @@ open class RtspHandler(
      * is never the HomeKit TLV8 variant.
      */
     private fun handlePairVerify(request: RtspRequest): RtspResponse {
-        // PIN access control: refuse pair-verify until the controller has PIN-paired this connection.
-        // macOS responds to the rejection by starting the PIN flow (/pair-pin-start → /pair-setup-pin).
-        if (pinAuthEnabled && !pinPaired) {
-            Logger.i("pair-verify rejected — PIN pairing required first (triggers /pair-pin-start)")
-            return RtspResponse(470, "Connection Authorization Required", protocol = request.responseProtocol())
-        }
         return try {
+            // PairingSession checks the M1 controller key against the PIN-paired store, then checks
+            // possession of its private key in M2. Unknown controllers receive 470 and start SRP.
             val body = pairingSession!!.pairVerify(request.bodyBytes)
             Logger.i("pair-verify ${if (request.bodyBytes.firstOrNull()?.toInt() == 1) "M1" else "M2"} OK (returned ${body.size} bytes)")
             RtspResponse(200, "OK", bodyBytes = body, contentType = OCTET_STREAM, protocol = request.responseProtocol())
@@ -527,10 +556,11 @@ open class RtspHandler(
      */
     private fun handlePairPinStart(request: RtspRequest): RtspResponse {
         if (!pinAuthEnabled) return handleUnknownInternal(request)
-        if ((pairingStore?.failedAttempts() ?: 0) >= MAX_PAIR_ATTEMPTS) {
+        if (controllerStore.failedAttempts() >= MAX_PAIR_ATTEMPTS) {
             Logger.w("pair-pin-start blocked — PIN auth locked ($MAX_PAIR_ATTEMPTS failed attempts)")
             return RtspResponse(470, "Connection Authorization Required", protocol = request.responseProtocol())
         }
+        if (currentRemoteAddress == null) return RtspResponse(400, "Bad Request", protocol = request.responseProtocol())
         newSrpSession()
         Logger.i("pair-pin-start — PIN shown, SRP session primed")
         return RtspResponse(200, "OK", protocol = request.responseProtocol())
@@ -541,6 +571,15 @@ open class RtspHandler(
         val pin = "%0${PIN_DIGITS}d".format(java.security.SecureRandom().nextInt(PIN_SPACE))
         onShowPin(pin)
         legacyPin = dev.imirror.receiver.airplay.handshake.LegacyPairSetupPin(pin, PairingKeys.get(context).edPublic)
+        legacyPinAddress = currentRemoteAddress
+        legacyPinStartedNanos = System.nanoTime()
+    }
+
+    private fun clearPendingPin() {
+        legacyPin = null
+        legacyPinAddress = null
+        legacyPinStartedNanos = 0
+        onShowPin(null)
     }
 
     /**
@@ -550,26 +589,41 @@ open class RtspHandler(
      */
     private fun handleLegacyPairSetupPin(request: RtspRequest): RtspResponse {
         if (!pinAuthEnabled) return handleUnknownInternal(request)
-        if ((pairingStore?.failedAttempts() ?: 0) >= MAX_PAIR_ATTEMPTS) {
+        if (controllerStore.failedAttempts() >= MAX_PAIR_ATTEMPTS) {
             Logger.w("pair-setup-pin blocked — PIN auth locked ($MAX_PAIR_ATTEMPTS failed attempts)")
             onShowPin(null)
             return RtspResponse(470, "Connection Authorization Required", protocol = request.responseProtocol())
         }
         return try {
             val plist = PlistCodec.decode(request.bodyBytes)
-            if (legacyPin == null) newSrpSession()   // step 1 may arrive without a prior /pair-pin-start
+            if (legacyPin != null && System.nanoTime() - legacyPinStartedNanos >= PIN_HANDSHAKE_LIFETIME_NANOS) {
+                clearPendingPin()
+            }
+            // An IP address scopes an unfinished exchange only; it never grants playback trust.
+            if (currentRemoteAddress == null || (legacyPin != null && currentRemoteAddress != legacyPinAddress)) {
+                return RtspResponse(470, "Connection Authorization Required", protocol = request.responseProtocol())
+            }
+            if (legacyPin == null) {
+                if (plist["method"] != "pin" || plist["user"] !is String) {
+                    return RtspResponse(470, "Connection Authorization Required", protocol = request.responseProtocol())
+                }
+                newSrpSession() // Some senders omit /pair-pin-start before SRP step 1.
+            }
             val result = legacyPin!!.handle(plist)
             if (result.failed) {
-                val n = pairingStore?.recordFailedAttempt() ?: 0
+                val n = controllerStore.recordFailedAttempt()
                 Logger.w("pair-setup-pin attempt failed ($n/$MAX_PAIR_ATTEMPTS)")
-                onShowPin(null); legacyPin = null
+                clearPendingPin()
                 return RtspResponse(470, "Connection Authorization Required", protocol = request.responseProtocol())
             }
             if (result.complete) {
-                pairingStore?.resetFailedAttempts()   // legitimate pairing clears the lockout counter
-                pinPaired = true                       // now allow pair-verify → streaming proceeds
-                onShowPin(null); legacyPin = null
-                Logger.i("PIN pairing complete — pair-verify now permitted")
+                controllerStore.add(
+                    result.controllerId ?: error("PIN exchange omitted controller identifier"),
+                    result.controllerPublicKey ?: error("PIN exchange omitted controller public key")
+                )
+                controllerStore.resetFailedAttempts()
+                clearPendingPin()
+                Logger.i("PIN pairing complete — controller key stored for signed pair-verify")
             }
             RtspResponse(
                 200, "OK",
@@ -579,7 +633,7 @@ open class RtspHandler(
             )
         } catch (e: Exception) {
             Logger.e("pair-setup-pin failed", e)
-            onShowPin(null); legacyPin = null
+            clearPendingPin()
             RtspResponse(400, "Bad Request", protocol = request.responseProtocol())
         }
     }
@@ -845,7 +899,7 @@ open class RtspHandler(
         return if (query.startsWith("volume")) {
             RtspResponse(
                 statusCode = 200, statusMessage = "OK",
-                body = "volume: %.6f\r\n".format(currentVolume),
+                body = "volume: %.6f\r\n".format(java.util.Locale.US, currentVolume),
                 contentType = "text/parameters",
                 protocol = request.responseProtocol()
             )
@@ -855,17 +909,11 @@ open class RtspHandler(
     }
 
     private fun handleSetParameter(request: RtspRequest): RtspResponse {
-        val body = request.body
-        val contentType = request.headers["Content-Type"]?.lowercase() ?: ""
+        val contentType = request.headers.entries.firstOrNull {
+            it.key.equals("Content-Type", ignoreCase = true)
+        }?.value?.lowercase(java.util.Locale.ROOT) ?: ""
         // Text bodies carry "volume: <dB>"; binary bodies carry DMAP now-playing metadata or artwork.
         when {
-            body.startsWith("volume") -> {
-                body.substringAfter(":").trim().toFloatOrNull()?.let { v ->
-                    currentVolume = v
-                    onVolume(v)
-                    Logger.d("SET_PARAMETER volume=$v")
-                }
-            }
             contentType.startsWith("image/") -> {
                 // Album artwork (image/jpeg, image/png). A zero-length body clears it.
                 onArtwork(request.bodyBytes)
@@ -876,9 +924,16 @@ open class RtspHandler(
                 onNowPlayingMetadata(meta.title, meta.artist, meta.album)
                 Logger.i("SET_PARAMETER now-playing: title='${meta.title}' artist='${meta.artist}' album='${meta.album}'")
             }
+            request.body.trimStart().startsWith("volume:") -> {
+                request.body.substringAfter(":").trim().toFloatOrNull()?.takeIf { it.isFinite() }?.let { v ->
+                    currentVolume = v.coerceIn(-144f, 0f)
+                    onVolume(currentVolume)
+                    Logger.d("SET_PARAMETER volume=$currentVolume")
+                }
+            }
             else -> Logger.d("SET_PARAMETER (${request.bodyBytes.size}B, $contentType, unhandled)")
         }
-        return RtspResponse(statusCode = 200, statusMessage = "OK")
+        return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
     }
 
     /** Heuristic: a DMAP body starts with the `mlit` listing-item container tag. */
@@ -984,6 +1039,8 @@ open class RtspHandler(
     }
 
     companion object {
+        private const val HANDSHAKE_IDLE_TIMEOUT_MS = 60_000
+        private const val PIN_HANDSHAKE_LIFETIME_NANOS = 180_000_000_000L
         private const val RTSP_PORT = 7000
 
         // SRP PIN access control. macOS's AirPlay code-entry field is exactly 4 digits, so the PIN

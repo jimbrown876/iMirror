@@ -2,156 +2,128 @@ package dev.imirror.receiver.airplay
 
 import android.content.Context
 import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
+import dev.imirror.receiver.service.ProtocolState
+import dev.imirror.receiver.util.NetworkUtils
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.mockkObject
+import io.mockk.unmockkAll
 import io.mockk.verify
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertTrue
+import org.junit.After
+import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
-/**
- * MdnsServiceTest — Unit tests for MdnsService.
- *
- * WHY: MdnsService is the gateway between iMirror and macOS discovery.
- * If the mDNS registration is wrong (wrong service type, missing TXT records),
- * macOS will never show iMirror in the AirPlay menu. These tests verify that
- * the registration is correct without actually using the network.
- *
- * HOW: We mock the Android [NsdManager] and [Context] to avoid needing a real
- * Android device. MockK is used to create mock objects and verify interactions.
- *
- * Test naming convention: test_[methodName]_[scenario]_[expectedResult]
- */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
 class MdnsServiceTest {
-
-    // The class under test
-    private lateinit var mdnsService: MdnsService
-
-    // Mock objects — these simulate Android system services without real hardware
-    private lateinit var mockContext: Context
-    private lateinit var mockNsdManager: NsdManager
+    private val context = mockk<Context>(relaxed = true)
+    private val nsd = mockk<NsdManager>(relaxed = true)
+    private val responder = mockk<MdnsDiscoveryResponder>(relaxed = true)
+    private val registrations = mutableListOf<Pair<NsdServiceInfo, NsdManager.RegistrationListener>>()
+    private val states = mutableListOf<ProtocolState>()
+    private lateinit var service: MdnsService
 
     @Before
     fun setup() {
-        // Create mocks for Android dependencies
-        mockContext = mockk(relaxed = true)
-        mockNsdManager = mockk(relaxed = true)
-
-        // Tell the mock context to return our mock NsdManager
-        every { mockContext.getSystemService(Context.NSD_SERVICE) } returns mockNsdManager
-
-        mdnsService = MdnsService(mockContext)
-    }
-
-    /**
-     * Test: When start() is called, MdnsService registers exactly 2 mDNS services.
-     *
-     * WHY: AirPlay requires both _airplay._tcp AND _raop._tcp to be registered.
-     * If either is missing, macOS may not show the device or may fail to connect.
-     */
-    @Test
-    fun `start registers two mDNS services`() {
-        mdnsService.start()
-
-        // Verify that NsdManager.registerService was called exactly 2 times
-        verify(exactly = 2) {
-            mockNsdManager.registerService(any(), NsdManager.PROTOCOL_DNS_SD, any())
+        mockkObject(NetworkUtils)
+        every { NetworkUtils.getMacAddress(context) } returns "02:11:22:33:44:55"
+        every { NetworkUtils.getPersistentUuid(context) } returns "fixture-uuid"
+        every { NetworkUtils.getDeviceName(context) } returns "Bedroom"
+        every { context.getSystemService(Context.NSD_SERVICE) } returns nsd
+        every { nsd.registerService(any(), any(), any()) } answers {
+            registrations.add(firstArg<NsdServiceInfo>() to thirdArg<NsdManager.RegistrationListener>())
         }
+        service = MdnsService(context, { states.add(it) }, discoveryResponderFactory = { responder })
     }
 
-    /**
-     * Test: Calling start() twice does not register services twice.
-     *
-     * WHY: If start() is accidentally called twice, we'd have duplicate mDNS
-     * registrations, which could cause conflicts. The idempotency check must work.
-     */
-    @Test
-    fun `start is idempotent when called twice`() {
-        mdnsService.start()
-        mdnsService.start()  // Second call should be ignored
+    @After
+    fun teardown() { unmockkAll() }
 
-        // Should still only be registered once (2 services from the first call)
-        verify(exactly = 2) {
-            mockNsdManager.registerService(any(), NsdManager.PROTOCOL_DNS_SD, any())
-        }
+    private fun registered(index: Int, name: String? = null) {
+        val (info, listener) = registrations[index]
+        if (name != null) info.serviceName = name
+        listener.onServiceRegistered(info)
     }
 
-    /**
-     * Test: When stop() is called after start(), both services are unregistered.
-     *
-     * WHY: When the app closes, mDNS services must be unregistered so they
-     * disappear from the macOS AirPlay menu. Failing to unregister means the
-     * device stays in the menu even when iMirror is not running.
-     */
     @Test
-    fun `stop unregisters services after start`() {
-        mdnsService.start()
-        mdnsService.stop()
-
-        // Verify that unregisterService was called for each registered listener
-        verify(exactly = 2) {
-            mockNsdManager.unregisterService(any())
-        }
-    }
-
-    /**
-     * Test: Calling stop() without a prior start() does not crash.
-     *
-     * WHY: MainActivity.onDestroy() always calls receiver.stop(), even if
-     * onCreate() failed before start() was called. Stop must be safe to call
-     * in any state.
-     */
-    @Test
-    fun `stop without start does not crash`() {
-        // This must not throw any exception
-        mdnsService.stop()
-    }
-
-    /**
-     * Test: AIRPLAY_PORT is 7000 (the standard AirPlay port).
-     *
-     * WHY: AirPlay requires exactly port 7000. Using any other port means
-     * macOS won't be able to connect to iMirror.
-     */
-    @Test
-    fun `AIRPLAY_PORT is 7000`() {
-        assertEquals(7000, MdnsService.AIRPLAY_PORT)
-    }
-
-    /**
-     * Test: stop() without start() emits DISABLED state.
-     *
-     * WHY: After stop(), the UI should show the protocol as disabled
-     * even if start() was never called.
-     */
-    @Test
-    fun `stop emits DISABLED protocol state`() {
-        val states = mutableListOf<dev.imirror.receiver.service.ProtocolState>()
-        val service = MdnsService(mockContext, onStateChange = { states.add(it) })
-
-        service.stop()
-
-        assertTrue(states.contains(dev.imirror.receiver.service.ProtocolState.DISABLED))
-    }
-
-    /**
-     * Test: restart() calls stop then start (2 unregistrations + 2 registrations).
-     *
-     * WHY: Restart must fully tear down and re-advertise so the device name
-     * change from Settings takes effect immediately.
-     */
-    @Test
-    fun `restart unregisters then re-registers services`() {
-        val service = MdnsService(mockContext)
+    fun `registration is serialized and only complete after both callbacks`() {
         service.start()
-        service.restart()
+        assertEquals(1, registrations.size)
+        assertEquals("_raop._tcp", registrations[0].first.serviceType)
+        assertFalse(states.contains(ProtocolState.ADVERTISING))
+        registered(0)
+        assertEquals(2, registrations.size)
+        assertEquals("_airplay._tcp", registrations[1].first.serviceType)
+        assertEquals(7000, registrations[1].first.port)
+        assertFalse(states.contains(ProtocolState.ADVERTISING))
+        registered(1)
+        assertEquals(listOf(ProtocolState.ADVERTISING), states)
+        verify(exactly = 1) { responder.activate("Bedroom", "021122334455@Bedroom") }
+    }
 
-        // After restart: stop (2 unregisters) + start (2 registers) = 4 register calls total
-        // But first start = 2, restart start = 2 more
-        verify(atLeast = 4) {
-            mockNsdManager.registerService(any(), NsdManager.PROTOCOL_DNS_SD, any())
-        }
+    @Test
+    fun `duplicate start and callbacks cannot create duplicate registrations`() {
+        service.start()
+        service.start()
+        registered(0)
+        registered(0)
+        registered(1)
+        registered(1)
+        assertEquals(2, registrations.size)
+        assertEquals(1, states.count { it == ProtocolState.ADVERTISING })
+    }
+
+    @Test
+    fun `responder uses actual names after independent collisions`() {
+        service.start()
+        registered(0, "021122334455@Bedroom (2)")
+        registered(1, "Bedroom (3)")
+        verify { responder.activate("Bedroom (3)", "021122334455@Bedroom (2)") }
+    }
+
+    @Test
+    fun `late callback after stop cannot register the next service`() {
+        service.start()
+        service.stop()
+        registered(0)
+        assertEquals(1, registrations.size)
+        assertEquals(ProtocolState.DISABLED, states.last())
+        verify(exactly = 0) { responder.activate(any(), any()) }
+    }
+
+    @Test
+    fun `restart ignores prior generation callbacks`() {
+        service.start()
+        service.restart("Living Room")
+        registered(0)
+        assertEquals(2, registrations.size)
+        registered(1)
+        registered(2)
+        verify { responder.activate("Living Room", "021122334455@Living Room") }
+    }
+
+    @Test
+    fun `stop unregisters second listener even when first unregister throws`() {
+        service.start()
+        registered(0)
+        registered(1)
+        every { nsd.unregisterService(registrations[1].second) } throws IllegalArgumentException("gone")
+        service.stop()
+        verify { nsd.unregisterService(registrations[0].second) }
+        verify { responder.stop() }
+    }
+
+    @Test
+    fun `already active error is not treated as a successful advertisement`() {
+        service.start()
+        registrations[0].second.onRegistrationFailed(registrations[0].first, NsdManager.FAILURE_ALREADY_ACTIVE)
+        assertEquals(1, registrations.size)
+        assertEquals(ProtocolState.ERROR, states.last())
+        assertFalse(states.contains(ProtocolState.ADVERTISING))
     }
 }

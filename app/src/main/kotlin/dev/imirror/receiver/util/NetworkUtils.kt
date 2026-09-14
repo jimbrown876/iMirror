@@ -5,6 +5,7 @@ import android.net.wifi.WifiManager
 import android.provider.Settings
 import timber.log.Timber
 import java.net.NetworkInterface
+import java.security.MessageDigest
 import java.util.UUID
 
 /**
@@ -66,7 +67,11 @@ object NetworkUtils {
      *
      * @return MAC address in "aa:bb:cc:dd:ee:ff" format (lowercase, colon-separated).
      */
-    fun getMacAddress(): String {
+    fun getMacAddress(context: Context? = null): String {
+        // Android 11 commonly hides hardware addresses from ordinary applications.
+        // Each receiver still needs a distinct, stable AirPlay device identity.
+        val fallback = context?.let { localDeviceAddress(getPersistentUuid(it)) }
+            ?: FALLBACK_MAC_ADDRESS
         return try {
             // Iterate all network interfaces to find the Wi-Fi or Ethernet interface
             val interfaces = NetworkInterface.getNetworkInterfaces()?.toList() ?: emptyList()
@@ -80,11 +85,19 @@ object NetworkUtils {
                 }
                 .firstOrNull()
 
-            mac ?: FALLBACK_MAC_ADDRESS
+            mac ?: fallback
         } catch (e: Exception) {
             Timber.w(e, "Could not read MAC address — using fallback")
-            FALLBACK_MAC_ADDRESS
+            fallback
         }
+    }
+
+    internal fun localDeviceAddress(persistentId: String): String {
+        val bytes = MessageDigest.getInstance("SHA-256")
+            .digest(persistentId.toByteArray(Charsets.UTF_8)).copyOf(6)
+        // Locally administered, unicast address; this is an identifier, not a NIC change.
+        bytes[0] = ((bytes[0].toInt() and 0xfc) or 0x02).toByte()
+        return bytes.joinToString(":") { "%02x".format(it.toInt() and 0xff) }
     }
 
     /**

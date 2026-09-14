@@ -49,7 +49,8 @@ class MdnsService(
      * Only the `_airplay._tcp` service name is reported (not the `_raop._tcp` name,
      * which has a MAC address prefix and is not shown to users).
      */
-    private val onActualNameRegistered: (String) -> Unit = {}
+    private val onActualNameRegistered: (String) -> Unit = {},
+    private val discoveryResponderFactory: () -> MdnsDiscoveryResponder = { MdnsDiscoveryResponder() }
 ) {
 
     // Android's built-in mDNS manager — handles multicast registration
@@ -59,6 +60,10 @@ class MdnsService(
     // Listeners track registration state; held to enable unregistration later
     private var airPlayListener: NsdManager.RegistrationListener? = null
     private var raopListener: NsdManager.RegistrationListener? = null
+    private var discoveryResponder: MdnsDiscoveryResponder? = null
+    private var generation = 0
+    private var actualAirPlayName = ""
+    private var actualRaopName = ""
 
     // Count of how many services have confirmed registration.
     // Only when both reach 2 do we emit ProtocolState.ADVERTISING.
@@ -89,13 +94,17 @@ class MdnsService(
      * @param displayNameOverride User-configured display name from Settings.
      *   Pass `null` or blank to use the Android system device name.
      */
+    @Synchronized
     fun start(displayNameOverride: String? = null) {
         if (isStarted) {
             Logger.w("MdnsService.start() called but already registered — ignoring")
             return
         }
         isStarted = true
+        generation++
         registeredCount = 0
+        actualAirPlayName = ""
+        actualRaopName = ""
 
         val effectiveName = resolveDisplayName(displayNameOverride)
         Logger.i("Starting mDNS advertising as '$effectiveName'")
@@ -110,7 +119,16 @@ class MdnsService(
         // invisible in the iOS Screen Mirroring menu (that menu keys off _airplay._tcp).
         //
         // So: register _raop first, and only chain _airplay once its callback has landed.
-        registerRaopService(effectiveName)
+        // Listen before NSD announces so supplemental answers reuse its exact SRV
+        // hostname, TXT data and address records. It answers only after registration.
+        discoveryResponder = discoveryResponderFactory().also { it.start() }
+        try {
+            registerRaopService(effectiveName)
+        } catch (e: Exception) {
+            Logger.e("Unable to start mDNS registration", e)
+            stop()
+            onStateChange(ProtocolState.ERROR)
+        }
     }
 
     /**
@@ -121,21 +139,25 @@ class MdnsService(
      *
      * Safe to call even if [start] was never called.
      */
+    @Synchronized
     fun stop() {
         Logger.i("Stopping mDNS advertising")
-        try {
-            airPlayListener?.let { nsdManager.unregisterService(it) }
-            raopListener?.let { nsdManager.unregisterService(it) }
-        } catch (e: Exception) {
-            // Unregistration errors are non-fatal: service will expire via mDNS TTL
-            Logger.e("Error unregistering mDNS services (non-fatal)", e)
-        } finally {
-            airPlayListener = null
-            raopListener = null
-            registeredCount = 0
-            isStarted = false
-            onStateChange(ProtocolState.DISABLED)
+        isStarted = false
+        generation++
+        discoveryResponder?.stop()
+        discoveryResponder = null
+        listOfNotNull(airPlayListener, raopListener).forEach { listener ->
+            try {
+                nsdManager.unregisterService(listener)
+            } catch (e: Exception) {
+                // Still unregister the other service if one listener was not active.
+                Logger.e("Error unregistering mDNS service (non-fatal)", e)
+            }
         }
+        airPlayListener = null
+        raopListener = null
+        registeredCount = 0
+        onStateChange(ProtocolState.DISABLED)
     }
 
     /**
@@ -178,7 +200,7 @@ class MdnsService(
             port = AIRPLAY_PORT
 
             // Core identity TXT records
-            setAttribute("deviceid", NetworkUtils.getMacAddress())
+            setAttribute("deviceid", NetworkUtils.getMacAddress(context))
             setAttribute("features", AIRPLAY_FEATURES)
             setAttribute("model", AIRPLAY_MODEL)
             setAttribute("srcvers", AIRPLAY_SERVER_VERSION)
@@ -190,6 +212,7 @@ class MdnsService(
         airPlayListener = createRegistrationListener(
             serviceLabel = "_airplay._tcp",
             onRegisteredName = { actualName ->
+                actualAirPlayName = actualName
                 // Detect collision auto-renaming: NsdManager appended " (2)", " (3)", etc.
                 if (actualName != requestedName) {
                     Logger.w("mDNS name collision detected: requested='$requestedName' " +
@@ -216,7 +239,7 @@ class MdnsService(
      * @param displayName The device name portion of the RAOP service name.
      */
     private fun registerRaopService(displayName: String) {
-        val macHex = NetworkUtils.getMacAddress().replace(":", "").uppercase()
+        val macHex = NetworkUtils.getMacAddress(context).replace(":", "").uppercase()
 
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = "$macHex@$displayName"  // required RAOP format
@@ -236,7 +259,7 @@ class MdnsService(
 
         raopListener = createRegistrationListener(
             serviceLabel = "_raop._tcp",
-            onRegisteredName = null,  // RAOP name has MAC prefix — not shown to users
+            onRegisteredName = { actualRaopName = it },
             onSuccess = {
                 incrementAndCheckBothRegistered()
                 // Only now is it safe to register the second service — see start().
@@ -256,6 +279,7 @@ class MdnsService(
     private fun incrementAndCheckBothRegistered() {
         registeredCount++
         if (registeredCount >= 2) {
+            discoveryResponder?.activate(actualAirPlayName, actualRaopName)
             onStateChange(ProtocolState.ADVERTISING)
         }
     }
@@ -275,27 +299,38 @@ class MdnsService(
         onSuccess: () -> Unit,
         onFailure: () -> Unit
     ): NsdManager.RegistrationListener {
+        val listenerGeneration = generation
         return object : NsdManager.RegistrationListener {
+            private var completed = false
 
             override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
-                // NsdManager may append " (2)" to resolve name conflicts.
-                // Log the actual name so we can debug picker-visibility issues.
-                Logger.i("mDNS registered: $serviceLabel as '${serviceInfo.serviceName}'")
-                onRegisteredName?.invoke(serviceInfo.serviceName)
-                onSuccess()
+                synchronized(this@MdnsService) {
+                    if (!isStarted || generation != listenerGeneration) {
+                        try { nsdManager.unregisterService(this) } catch (_: Exception) { }
+                        return
+                    }
+                    if (completed) return
+                    completed = true
+                    // NsdManager may append " (2)" to resolve name conflicts.
+                    // Log the actual name so we can debug picker-visibility issues.
+                    Logger.i("mDNS registered: $serviceLabel as '${serviceInfo.serviceName}'")
+                    onRegisteredName?.invoke(serviceInfo.serviceName)
+                    try { onSuccess() } catch (e: Exception) {
+                        Logger.e("Unable to complete mDNS registration", e)
+                        stop()
+                        onFailure()
+                    }
+                }
             }
 
             override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                // Error codes from NsdManager:
-                //   FAILURE_ALREADY_ACTIVE (3) — already registered; treat as success
-                //   FAILURE_MAX_LIMIT (4)      — too many services (should not happen)
-                //   FAILURE_INTERNAL_ERROR (0) — system mDNS daemon issue
-                if (errorCode == NsdManager.FAILURE_ALREADY_ACTIVE) {
-                    Logger.w("mDNS $serviceLabel already active — treating as success")
-                    onSuccess()
-                } else {
+                synchronized(this@MdnsService) {
+                    if (!isStarted || generation != listenerGeneration || completed) return
+                    completed = true
+                    // FAILURE_ALREADY_ACTIVE is a failed operation, not proof of a
+                    // successful registration under the requested service identity.
                     Logger.e("mDNS registration FAILED for $serviceLabel, errorCode=$errorCode")
-                    isStarted = false
+                    stop()
                     onFailure()
                 }
             }
@@ -305,7 +340,7 @@ class MdnsService(
             }
 
             override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                // Non-fatal: the service will expire via mDNS TTL (~4500ms by default)
+                // Non-fatal: stale records expire according to their DNS TTL.
                 Logger.w("mDNS unregistration failed for $serviceLabel, errorCode=$errorCode (non-fatal)")
             }
         }

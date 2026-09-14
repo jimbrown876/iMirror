@@ -27,6 +27,15 @@ import org.junit.Test
  */
 class NetworkUtilsTest {
 
+    @Test
+    fun `fallback addresses distinguish receivers and survive restarts`() {
+        val bedroom = NetworkUtils.localDeviceAddress("receiver-bedroom")
+        val livingRoom = NetworkUtils.localDeviceAddress("receiver-living-room")
+        assertEquals(bedroom, NetworkUtils.localDeviceAddress("receiver-bedroom"))
+        assertFalse(bedroom == livingRoom)
+        assertEquals(2, bedroom.substringBefore(":").toInt(16) and 3)
+    }
+
     private lateinit var mockContext: Context
     private lateinit var mockContentResolver: ContentResolver
 

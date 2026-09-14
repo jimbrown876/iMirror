@@ -1,3 +1,7 @@
+> **Personal fork:** source-built compatibility repairs for TCL Google TV are being tested here.
+> See [personal build notes](docs/PERSONAL-BUILD.md) for the tested scope and remaining checks.
+> The inherited APKs in `apk/` are upstream binaries, **not** this fork's repaired build.
+
 <div align="center">
 
 <img src="docs/hero.png" alt="iMirror — free AirPlay receiver for Android TV to mirror iPhone, iPad and MacBook screens" width="100%">
@@ -111,11 +115,12 @@ Senders: **iPhone**, **iPad**, and **Mac** running macOS 12 or newer.
 
 ## Known limitations
 
-- **Netflix, Disney+, Apple TV+ will not mirror.** Apple's FairPlay DRM protects
-  these on every AirPlay path. No open-source receiver can decrypt them — this is
-  not a bug and cannot be fixed.
-- **Apple Music in-app audio** is protected the same way. Route your Mac's system
-  audio output instead, which works.
+- **Protected video compatibility is not guaranteed.** Streaming services can
+  restrict playback on unofficial receivers; this fork does not bypass DRM.
+- **Apple Music audio is under physical-device testing.** iPhone ALAC audio has
+  negotiated and decoded on both test TVs. The personal build repairs artwork-
+  triggered disconnects; sustained playback and song changes still require
+  verification on the installed repair. Audio-only and mirroring are separate paths.
 - **Same network required.** Apple TV can accept connections off-network via
   Apple's AWDL protocol; Android hardware cannot do AWDL.
 - **H.264 only** — HEVC is not implemented yet.
@@ -127,7 +132,7 @@ Senders: **iPhone**, **iPad**, and **Mac** running macOS 12 or newer.
 Requires JDK 17+, and an Android SDK with NDK `28.2.13676358` and CMake 3.22.1.
 
 ```sh
-git clone https://github.com/prat3ik/iMirror.git
+git clone https://github.com/jimbrown876/iMirror.git
 cd iMirror
 ./gradlew assembleDebug
 ```

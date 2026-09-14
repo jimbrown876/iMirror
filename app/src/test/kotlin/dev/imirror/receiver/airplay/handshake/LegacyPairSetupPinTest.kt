@@ -1,6 +1,8 @@
 package dev.imirror.receiver.airplay.handshake
 
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.math.BigInteger
@@ -45,10 +47,16 @@ class LegacyPairSetupPinTest {
             "authTag" to clientEpk.copyOfRange(clientEpk.size - 16, clientEpk.size),
         ))
         assertTrue("server must complete after the AES key exchange", r3.complete)
+        assertEquals(user, r3.controllerId)
+        assertArrayEquals("the PIN-authenticated controller identity must be retained", clientEdPublic, r3.controllerPublicKey)
         // Server reply is encrypted at IV+2 (per-message counter) — decrypt with the next IV.
         incrementIv(aesIv)
         val serverEpk = (r3.reply!!["epk"] as ByteArray) + (r3.reply!!["authTag"] as ByteArray)
         assertArrayEquals("decrypted accessory key must match", serverEdPublic, gcm(false, aesKey, aesIv, serverEpk))
+        assertTrue("a completed exchange cannot enroll another key", server.handle(mapOf(
+            "epk" to clientEpk.copyOf(clientEpk.size - 16),
+            "authTag" to clientEpk.copyOfRange(clientEpk.size - 16, clientEpk.size)
+        )).failed)
     }
 
     @Test
@@ -60,6 +68,45 @@ class LegacyPairSetupPinTest {
         val client = RefClient("u", "0000", salt, b)   // wrong PIN
         val r2 = server.handle(mapOf("pk" to toBytes(client.a), "proof" to client.m1))
         assertTrue("server must reject a wrong-PIN proof", r2.failed)
+    }
+
+    @Test
+    fun `SRP proof alone does not enroll a controller`() {
+        val server = LegacyPairSetupPin("4271", ByteArray(32))
+        val r1 = server.handle(mapOf("method" to "pin", "user" to "u"))
+        val client = RefClient("u", "4271", r1.reply!!["salt"] as ByteArray, BigInteger(1, r1.reply!!["pk"] as ByteArray))
+        val r2 = server.handle(mapOf("pk" to toBytes(client.a), "proof" to client.m1))
+        assertFalse(r2.failed)
+        assertFalse(r2.complete)
+        org.junit.Assert.assertNull(r2.controllerPublicKey)
+        val tampered = server.handle(mapOf("epk" to ByteArray(32), "authTag" to ByteArray(16)))
+        assertTrue(tampered.failed)
+        assertFalse(tampered.complete)
+    }
+
+    @Test
+    fun `authenticated payload with wrong key length cannot be enrolled`() {
+        val server = LegacyPairSetupPin("4271", ByteArray(32))
+        val r1 = server.handle(mapOf("method" to "pin", "user" to "u"))
+        val client = RefClient("u", "4271", r1.reply!!["salt"] as ByteArray, BigInteger(1, r1.reply!!["pk"] as ByteArray))
+        server.handle(mapOf("pk" to toBytes(client.a), "proof" to client.m1))
+        val key = sha512("Pair-Setup-AES-Key".toByteArray(), client.k).copyOf(16)
+        val iv = sha512("Pair-Setup-AES-IV".toByteArray(), client.k).copyOf(16)
+        incrementIv(iv)
+        val encrypted = gcm(true, key, iv, ByteArray(31))!!
+        assertTrue(server.handle(mapOf(
+            "epk" to encrypted.copyOf(31), "authTag" to encrypted.copyOfRange(31, 47)
+        )).failed)
+    }
+
+    @Test
+    fun `out of order and oversized SRP messages fail closed`() {
+        val server = LegacyPairSetupPin("4271", ByteArray(32))
+        assertTrue(server.handle(mapOf("pk" to byteArrayOf(1), "proof" to ByteArray(20))).failed)
+        assertTrue(server.handle(mapOf("epk" to ByteArray(32), "authTag" to ByteArray(16))).failed)
+        server.handle(mapOf("method" to "pin", "user" to "u"))
+        assertTrue(server.handle(mapOf("pk" to ByteArray(257), "proof" to ByteArray(20))).failed)
+        assertTrue(server.handle(mapOf("pk" to byteArrayOf(0), "proof" to ByteArray(20))).failed)
     }
 
     /** Reference SRP-6a client matching Apple's legacy AirPlay routines. */

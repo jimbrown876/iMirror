@@ -1,6 +1,7 @@
 package dev.imirror.receiver.ui
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
@@ -15,6 +16,13 @@ import android.widget.TextView
 import dev.imirror.receiver.R
 import dev.imirror.receiver.airplay.NowPlayingInfo
 import dev.imirror.receiver.util.Logger
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * NowPlayingScreen — full-screen card shown while AirPlay audio plays without video (system audio
@@ -36,6 +44,9 @@ class NowPlayingScreen @JvmOverloads constructor(
     private val artistView: TextView
     private val albumView: TextView
     private val senderView: TextView
+    private val artworkRevision = ArtworkRevision()
+    private val artworkDecodeLock = Mutex()
+    private var artworkJob: Job? = null
 
     init {
         setBackgroundColor(color(R.color.background_dark))
@@ -85,21 +96,7 @@ class NowPlayingScreen @JvmOverloads constructor(
 
     /** Updates the card to reflect [info]. Falls back to a placeholder glyph when no artwork. */
     fun update(info: NowPlayingInfo) {
-        val bitmap = info.artwork?.let { runCatching { BitmapFactory.decodeByteArray(it, 0, it.size) }.getOrNull() }
-        if (bitmap != null) {
-            artwork.scaleType = ImageView.ScaleType.CENTER_CROP
-            artwork.setImageBitmap(bitmap)
-            artwork.setColorFilter(null)
-        } else {
-            // No artwork from the sender (typical for raw system audio) — show the AirPlay glyph.
-            artwork.scaleType = ImageView.ScaleType.CENTER_INSIDE
-            artwork.setImageResource(R.drawable.ic_airplay)
-            artwork.setColorFilter(color(R.color.text_secondary))
-            if (bitmap == null && info.artwork != null) {
-                Logger.w("NowPlayingScreen: artwork bytes (${info.artwork.size}B) failed to decode")
-            }
-        }
-
+        updateArtwork(info.artwork)
         titleView.text = info.title ?: context.getString(R.string.now_playing_audio)
         artistView.setTextVisible(info.artist)
         albumView.setTextVisible(info.album)
@@ -108,7 +105,67 @@ class NowPlayingScreen @JvmOverloads constructor(
 
     /** Releases the (potentially large) artwork bitmap when the card is hidden. */
     fun clear() {
+        artworkJob?.cancel()
+        artworkJob = null
+        artworkRevision.clear()
         artwork.setImageDrawable(null)
+    }
+
+    override fun onDetachedFromWindow() {
+        clear()
+        super.onDetachedFromWindow()
+    }
+
+    private fun updateArtwork(bytes: ByteArray?) {
+        val revision = artworkRevision.update(bytes) ?: return
+        artworkJob?.cancel()
+        artworkJob = null
+        showArtworkPlaceholder()
+        if (bytes == null || bytes.isEmpty()) return
+        val cardPixels = dp(ART_SIZE_DP).coerceAtLeast(1)
+        artworkJob = CoroutineScope(Dispatchers.Main.immediate).launch {
+            // Metadata and volume updates must not compete with audio/rendering on the main thread.
+            // Serialize native decodes: cancellation cannot interrupt an already-running decoder.
+            val bitmap = withContext(Dispatchers.Default) {
+                artworkDecodeLock.withLock { decodeArtwork(bytes, cardPixels) }
+            }
+            if (!artworkRevision.isCurrent(revision)) {
+                bitmap?.recycle() // This result was never attached to the ImageView.
+                return@launch
+            }
+            if (bitmap == null) {
+                Logger.w("NowPlayingScreen: artwork (${bytes.size}B) is invalid or exceeds decode limits")
+            } else {
+                artwork.scaleType = ImageView.ScaleType.CENTER_CROP
+                artwork.setImageBitmap(bitmap)
+                artwork.setColorFilter(null)
+            }
+        }
+    }
+
+    private fun decodeArtwork(bytes: ByteArray, cardPixels: Int): Bitmap? = runCatching {
+        // Android's recommended bounds-first decode avoids allocating full-resolution pixels.
+        // https://developer.android.com/topic/performance/graphics/load-bitmap
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+        val sample = ArtworkDecodePolicy.sampleSize(options.outWidth, options.outHeight, cardPixels, cardPixels)
+            ?: return@runCatching null
+        options.inJustDecodeBounds = false
+        options.inSampleSize = sample
+        options.inScaled = false
+        options.inPreferredConfig = Bitmap.Config.ARGB_8888
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: return@runCatching null
+        if (bitmap.width > ArtworkDecodePolicy.MAX_DECODED_EDGE || bitmap.height > ArtworkDecodePolicy.MAX_DECODED_EDGE ||
+            bitmap.allocationByteCount > ArtworkDecodePolicy.MAX_DECODED_BYTES) {
+            bitmap.recycle()
+            null
+        } else bitmap
+    }.getOrNull()
+
+    private fun showArtworkPlaceholder() {
+        artwork.scaleType = ImageView.ScaleType.CENTER_INSIDE
+        artwork.setImageResource(R.drawable.ic_airplay)
+        artwork.setColorFilter(color(R.color.text_secondary))
     }
 
     private fun TextView.setTextVisible(value: String?) {

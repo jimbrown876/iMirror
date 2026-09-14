@@ -29,6 +29,11 @@ class AppSettingsTest {
     }
 
     @Test
+    fun `receiver accepts the audio stream required by Mac system sound`() {
+        assertTrue(AppSettings.DEFAULT.mirrorAudioEnabled)
+    }
+
+    @Test
     fun `default settings have AirPlay enabled`() {
         assertTrue(AppSettings.DEFAULT.airPlayEnabled)
     }
