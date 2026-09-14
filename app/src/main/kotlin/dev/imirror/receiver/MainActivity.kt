@@ -87,7 +87,7 @@ class MainActivity : AppCompatActivity() {
 
             // Wire the streaming Surface so the service can pass it to VideoDecoder
             service?.setVideoSurfaceProvider { getVideoSurface() }
-            service?.setPresentationVisible(true)
+            service?.setPresentationVisible(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
 
             // Show/hide the full-screen overlay for video streams and photos.
             observeOverlayState()
@@ -134,6 +134,16 @@ class MainActivity : AppCompatActivity() {
         // Bind so we can observe StateFlows and supply the video Surface
         val intent = Intent(this, MirrorService::class.java)
         bindRequested = bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        service?.setPresentationVisible(true)
+    }
+
+    override fun onPause() {
+        service?.setPresentationVisible(false)
+        super.onPause()
     }
 
     override fun onStop() {
