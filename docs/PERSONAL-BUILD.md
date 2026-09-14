@@ -44,7 +44,9 @@ signing key for updates. The pre-existing files in `apk/` do not include these r
 
 Open iMirror once after the first installation. It can then listen while another
 TV app is visible. On these authorized Android 11 TCLs, automatic foregrounding
-requires the app-specific `SYSTEM_ALERT_WINDOW` special-access grant. It does not
+requires the app-specific `SYSTEM_ALERT_WINDOW` special-access grant, plus TCL's
+`APP_AUTO_START` app-op for boot/package-replacement delivery. Both were verified
+on these TVs; stock `AUTO_START` is not a recognized operation name. It does not
 draw floating overlays. On the same trusted network,
 choose that TV in Screen Mirroring for the display or the Music AirPlay speaker
 menu for audio-only playback. After updating the receiver, disconnect and reconnect
