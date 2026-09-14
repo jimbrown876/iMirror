@@ -650,6 +650,9 @@ class AirPlayReceiver(
         audioPlayer?.release()
         audioPlayer = null
         StreamStats.resetStreams()
+        // A photo session has no decoder/server to clear its UI state. Always clear the frame on
+        // full teardown so the temporary TV takeover and audio focus can return to the prior app.
+        onPhotoCleared()
         // Session fully torn down — clear now-playing so the UI leaves the audio card.
         audioPlaying = false
         videoPlaying = false
