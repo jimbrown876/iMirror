@@ -34,6 +34,49 @@ class AudioBufferingTest {
         assertEquals(List(8) { 2.toByte() }, heard)
     }
 
+    @Test
+    fun `flush clears pending PCM and the next audio drains normally`() {
+        val queue = PcmWriteQueue(16, 2)
+        queue.enqueueAndDrain(byteArrayOf(1, 2, 3, 4)) { _, _, _ -> 0 }
+        assertEquals(4, queue.pendingBytes)
+
+        queue.clear()
+        assertEquals(0, queue.pendingBytes)
+        val heard = mutableListOf<Byte>()
+        queue.enqueueAndDrain(byteArrayOf(5, 6)) { bytes, offset, length ->
+            heard.addAll(bytes.copyOfRange(offset, offset + length).toList())
+            length
+        }
+        assertEquals(listOf<Byte>(5, 6), heard)
+        assertEquals(0, queue.pendingBytes)
+    }
+
+    @Test
+    fun `software PCM volume applies unity half gain and mute in place`() {
+        val unity = byteArrayOf(0xFF.toByte(), 0x7F, 0x00, 0x80.toByte())
+        assertSame(unity, applyPcm16LeGainInPlace(unity, 1f))
+        assertArrayEquals(byteArrayOf(0xFF.toByte(), 0x7F, 0x00, 0x80.toByte()), unity)
+
+        val half = byteArrayOf(
+            0xFF.toByte(), 0x7F, 0x00, 0x80.toByte(),
+            0xE8.toByte(), 0x03, 0x18, 0xFC.toByte()
+        )
+        assertSame(half, applyPcm16LeGainInPlace(half, 0.5f))
+        assertArrayEquals(byteArrayOf(
+            0x00, 0x40, 0x00, 0xC0.toByte(),
+            0xF4.toByte(), 0x01, 0x0C, 0xFE.toByte()
+        ), half)
+
+        val muted = byteArrayOf(1, 2, 3, 4)
+        applyPcm16LeGainInPlace(muted, 0f)
+        assertArrayEquals(ByteArray(4), muted)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `software PCM volume rejects incomplete samples`() {
+        applyPcm16LeGainInPlace(byteArrayOf(1), 0.5f)
+    }
+
     @Test(expected = IllegalStateException::class)
     fun `negative AudioTrack error is detected instead of silently discarding audio`() {
         PcmWriteQueue(16, 4).enqueueAndDrain(ByteArray(4)) { _, _, _ -> -6 }
