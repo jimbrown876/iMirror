@@ -4,7 +4,17 @@ This GPL-3.0 personal fork retains upstream attribution and is based on
 `prat3ik/iMirror` main commit `9b52ce6d8bedb80ee557a5114d3cdbee4ab84f00`.
 It is not an Apple-certified receiver. No DRM bypass or paid service is included.
 
-## Current repair: 1.0.2-personal (version code 3)
+## Current personal build: 1.0.3-personal (version code 4)
+
+- Listen in a foreground service after leaving/removing the app task.
+- Restore the listener after boot and package replacement; migrate the existing
+  personal installation to start-on-boot once, preserving later user opt-outs.
+- Open a temporary playback screen on an accepted session, not discovery probes.
+  Return to the previous TV task on disconnect and release temporary audio focus.
+- Remove the sender footer from music cards, retaining cover/title/artist/album.
+- Wait boundedly for valid video output during automatic foreground handoff.
+
+The version 1.0.2 repairs below are retained:
 
 - Preserve room-specific names and distinct stable receiver identities.
 - Repair mDNS registration lifecycle and bounded local discovery responses.
@@ -32,14 +42,24 @@ Their APK is `app/build/outputs/apk/debug/app-armeabi-v7a-debug.apk`.
 It is a personal **debug build**, not a production/store release. Preserve the
 signing key for updates. The pre-existing files in `apk/` do not include these repairs.
 
-Open iMirror on the destination TV and leave it open. On the same trusted network,
+Open iMirror once after the first installation. It can then listen while another
+TV app is visible. On these authorized Android 11 TCLs, automatic foregrounding
+requires the app-specific `SYSTEM_ALERT_WINDOW` special-access grant. It does not
+draw floating overlays. On the same trusted network,
 choose that TV in Screen Mirroring for the display or the Music AirPlay speaker
 menu for audio-only playback. After updating the receiver, disconnect and reconnect
 the sender once so it establishes a new session. No Mac reboot is required.
 
 PIN authorization is optional and off by default; this default is for a trusted
-personal LAN, not an exposed/public network. Automatic background foregrounding,
-start-on-boot playback and multiroom synchronized audio are not claimed.
+personal LAN, not an exposed/public network. Do not expose receiver or ADB ports
+outside that LAN. Automatic connection interrupts the previous app using transient
+audio focus; disconnect returns to its task, but that app decides whether to resume
+playing automatically. The Stop notification action remains an explicit off switch.
+
+Listening cannot be guaranteed while the TV is unplugged, force-stopped, or in a
+vendor sleep mode that disables networking. Start-on-boot does not mean playing at
+boot: it restores the listener only. Real reboot/standby and synchronized multiroom
+audio are not claimed by local policy tests.
 
 ## Evidence and limits
 
