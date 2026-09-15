@@ -7,6 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import dev.imirror.receiver.airplay.handshake.PlistCodec
+import java.net.InetAddress
 
 /**
  * RtspHandlerTest — Unit tests for the RTSP protocol implementation.
@@ -34,7 +35,10 @@ class RtspHandlerTest {
     private var audioStopped = false
     private var videoStopped = false
     private var audioFlushes = 0
-    private var audioStartedArgs: List<Int>? = null
+    private var audioPauses = 0
+    private var audioResumes = 0
+    private var lastFlushBoundary: AudioFlushBoundary? = null
+    private var audioStartedSetup: RealtimeAudioSetup? = null
 
     @Before
     fun setup() {
@@ -47,7 +51,10 @@ class RtspHandlerTest {
         audioStopped = false
         videoStopped = false
         audioFlushes = 0
-        audioStartedArgs = null
+        audioPauses = 0
+        audioResumes = 0
+        lastFlushBoundary = null
+        audioStartedSetup = null
     }
 
     // ─── OPTIONS ─────────────────────────────────────────────────────────────
@@ -253,6 +260,7 @@ class RtspHandlerTest {
     fun `stream scoped audio TEARDOWN can be followed by audio SETUP on same session`() {
         val handler = createTestHandler(audioEnabled = true)
         handler.seedActiveStreams(96)
+        handler.seedRemoteAddress("192.168.1.77")
 
         val teardown = handler.handleTeardownPublic(teardownRequest(teardownBody(96)))
         assertEquals(200, teardown.statusCode)
@@ -262,7 +270,14 @@ class RtspHandlerTest {
 
         val setup = handler.routeRequest(mirrorAudioSetupRequest())
         assertEquals(200, setup.statusCode)
-        assertEquals(listOf(44100, 2, 2, 352), audioStartedArgs)
+        assertEquals(44100, audioStartedSetup?.sampleRate)
+        assertEquals(2, audioStartedSetup?.channels)
+        assertEquals(2, audioStartedSetup?.codecType)
+        assertEquals(352, audioStartedSetup?.framesPerPacket)
+        assertEquals("192.168.1.77", audioStartedSetup?.remoteAddress?.hostAddress)
+        assertEquals(62751, audioStartedSetup?.senderControlPort)
+        assertEquals(11025, audioStartedSetup?.latencyMinSamples)
+        assertEquals(88200, audioStartedSetup?.latencyMaxSamples)
         assertEquals(setOf(96), handler.activeStreamsSnapshot())
         assertFalse(streamingStopped)
         val streams = PlistCodec.decode(requireNotNull(setup.bodyBytes))["streams"] as List<*>
@@ -277,7 +292,12 @@ class RtspHandlerTest {
         val handler = createTestHandler()
         handler.seedMirrorSession()
         val flush = handler.routeRequest(
-            RtspRequest(method = "FLUSH", uri = "", headers = emptyMap(), body = "")
+            RtspRequest(
+                method = "FLUSH",
+                uri = "",
+                headers = mapOf("RTP-Info" to "seq=45170;rtptime=3644250311"),
+                body = ""
+            )
         )
         val pause = handler.handlePausePublic(
             RtspRequest(method = "PAUSE", uri = "", headers = emptyMap(), body = "")
@@ -285,14 +305,80 @@ class RtspHandlerTest {
 
         assertEquals(200, flush.statusCode)
         assertEquals(200, pause.statusCode)
-        assertEquals(2, audioFlushes)
+        assertEquals(1, audioFlushes)
+        assertEquals(1, audioPauses)
+        assertEquals(AudioFlushBoundary(45170, 3644250311L), lastFlushBoundary)
         assertFalse(streamingStopped)
 
         val resume = handler.handleRecordPublic(
-            RtspRequest(method = "RECORD", uri = "", headers = emptyMap(), body = "")
+            RtspRequest(
+                method = "RECORD",
+                uri = "",
+                headers = mapOf("RTP-Info" to "seq=45171;rtptime=3644250663"),
+                body = ""
+            )
         )
         assertEquals(200, resume.statusCode)
+        assertEquals(1, audioResumes)
+        assertEquals(AudioFlushBoundary(45171, 3644250663L), lastFlushBoundary)
         assertFalse("mirror RECORD must retain the existing control session", streamingStopped)
+    }
+
+    @Test
+    fun `realtime audio setup rejects unsupported format before replacing playback`() {
+        try {
+            RealtimeAudioSetup(
+                sampleRate = 44_100,
+                channels = 8,
+                codecType = 2,
+                framesPerPacket = 352,
+                remoteAddress = InetAddress.getByName("192.168.1.77"),
+                senderControlPort = 62_751,
+                latencyMinSamples = 11_025,
+                latencyMaxSamples = 88_200
+            )
+            throw AssertionError("Expected invalid channel count to be rejected")
+        } catch (expected: IllegalArgumentException) {
+            assertTrue(expected.message.orEmpty().contains("channel"))
+        }
+    }
+
+    @Test
+    fun `realtime audio setup rejects inverted latency range`() {
+        try {
+            RealtimeAudioSetup(
+                sampleRate = 44_100,
+                channels = 2,
+                codecType = 2,
+                framesPerPacket = 352,
+                remoteAddress = InetAddress.getByName("192.168.1.77"),
+                senderControlPort = 62_751,
+                latencyMinSamples = 22_050,
+                latencyMaxSamples = 11_025
+            )
+            throw AssertionError("Expected inverted latency range to be rejected")
+        } catch (expected: IllegalArgumentException) {
+            assertTrue(expected.message.orEmpty().contains("latency"))
+        }
+    }
+
+    @Test
+    fun `realtime AAC setup rejects a rate that cannot be represented by its config`() {
+        try {
+            RealtimeAudioSetup(
+                sampleRate = 48_001,
+                channels = 2,
+                codecType = 4,
+                framesPerPacket = 1_024,
+                remoteAddress = InetAddress.getByName("192.168.1.77"),
+                senderControlPort = 62_751,
+                latencyMinSamples = 0,
+                latencyMaxSamples = 0
+            )
+            throw AssertionError("Expected unsupported AAC rate to be rejected")
+        } catch (expected: IllegalArgumentException) {
+            assertTrue(expected.message.orEmpty().contains("AAC sample rate"))
+        }
     }
 
     @Test
@@ -384,13 +470,21 @@ class RtspHandlerTest {
             lastPhotoType = imageType
         },
         onPhotoCleared = { photoCleared = true },
-        onMirrorAudioStart = { sampleRate, channels, codecType, framesPerPacket ->
-            audioStartedArgs = listOf(sampleRate, channels, codecType, framesPerPacket)
+        onMirrorAudioStart = { setup ->
+            audioStartedSetup = setup
             7100 to 7101
         },
         onMirrorAudioStop = { audioStopped = true },
         onMirrorVideoStop = { videoStopped = true },
-        onAudioFlush = { audioFlushes++ }
+        onAudioFlush = { boundary ->
+            audioFlushes++
+            if (boundary != null) lastFlushBoundary = boundary
+        },
+        onAudioPause = { audioPauses++ },
+        onAudioResume = { boundary ->
+            audioResumes++
+            if (boundary != null) lastFlushBoundary = boundary
+        }
     )
 
     /** Binary-plist TEARDOWN body naming the given stream types, e.g. `{streams:[{type:96}]}`. */
@@ -406,7 +500,10 @@ class RtspHandlerTest {
             "sr" to 44100L,
             "channels" to 2L,
             "ct" to 2L,
-            "spf" to 352L
+            "spf" to 352L,
+            "controlPort" to 62751L,
+            "latencyMin" to 11025L,
+            "latencyMax" to 88200L
         ))))
         return RtspRequest(method = "SETUP", uri = "", headers = emptyMap(), body = "", bodyBytes = body)
     }
@@ -455,10 +552,12 @@ class TestableRtspHandler(
     audioEnabled: Boolean = false,
     onPhotoReceived: (ByteArray, PhotoImageType) -> Unit = { _, _ -> },
     onPhotoCleared: () -> Unit = {},
-    onMirrorAudioStart: (Int, Int, Int, Int) -> Pair<Int, Int> = { _, _, _, _ -> 0 to 0 },
+    onMirrorAudioStart: (RealtimeAudioSetup) -> Pair<Int, Int> = { 0 to 0 },
     onMirrorAudioStop: () -> Unit = {},
     onMirrorVideoStop: () -> Unit = {},
-    onAudioFlush: () -> Unit = {}
+    onAudioFlush: (AudioFlushBoundary?) -> Unit = {},
+    onAudioPause: () -> Unit = {},
+    onAudioResume: (AudioFlushBoundary?) -> Unit = {}
 ) : RtspHandler(
     context = io.mockk.mockk(relaxed = true),
     audioEnabled = audioEnabled,
@@ -470,12 +569,20 @@ class TestableRtspHandler(
     onMirrorAudioStart = onMirrorAudioStart,
     onMirrorAudioStop = onMirrorAudioStop,
     onMirrorVideoStop = onMirrorVideoStop,
-    onAudioFlush = onAudioFlush
+    onAudioFlush = onAudioFlush,
+    onAudioPause = onAudioPause,
+    onAudioResume = onAudioResume
 ) {
     /** Test seam: mark mirror streams active without driving the full FairPlay SETUP handshake. */
     fun seedActiveStreams(vararg types: Int) { activeStreamTypes.addAll(types.toList()) }
     fun activeStreamsSnapshot(): Set<Int> = activeStreamTypes.toSet()
     fun seedMirrorSession() = setPrivateBoolean("isMirrorSession", true)
+    fun seedRemoteAddress(address: String) {
+        RtspHandler::class.java.getDeclaredField("currentRemoteAddress").apply {
+            isAccessible = true
+            set(this@TestableRtspHandler, InetAddress.getByName(address))
+        }
+    }
 
     private fun setPrivateBoolean(name: String, value: Boolean) {
         RtspHandler::class.java.getDeclaredField(name).apply { isAccessible = true }.setBoolean(this, value)

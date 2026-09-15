@@ -1,13 +1,22 @@
 package dev.imirror.receiver.airplay
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.LinkAddress
+import android.net.LinkProperties
+import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
+import android.os.Looper
 import dev.imirror.receiver.service.ProtocolState
 import dev.imirror.receiver.util.NetworkUtils
+import io.mockk.Runs
 import io.mockk.every
+import io.mockk.just
 import io.mockk.mockk
 import io.mockk.mockkObject
+import io.mockk.slot
 import io.mockk.unmockkAll
 import io.mockk.verify
 import org.junit.After
@@ -16,16 +25,26 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.net.InetAddress
+import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [28])
+@Config(sdk = [30])
 class MdnsServiceTest {
     private val context = mockk<Context>(relaxed = true)
     private val nsd = mockk<NsdManager>(relaxed = true)
+    private val connectivity = mockk<ConnectivityManager>(relaxed = true)
+    private val wifi = mockk<WifiManager>(relaxed = true)
+    private val multicastLock = mockk<WifiManager.MulticastLock>(relaxed = true)
+    private val network = mockk<Network>()
+    private val replacementNetwork = mockk<Network>()
     private val responder = mockk<MdnsDiscoveryResponder>(relaxed = true)
     private val registrations = mutableListOf<Pair<NsdServiceInfo, NsdManager.RegistrationListener>>()
     private val states = mutableListOf<ProtocolState>()
+    private val networkCallback = slot<ConnectivityManager.NetworkCallback>()
+    private var responderEnded: (() -> Unit)? = null
     private lateinit var service: MdnsService
 
     @Before
@@ -35,14 +54,45 @@ class MdnsServiceTest {
         every { NetworkUtils.getPersistentUuid(context) } returns "fixture-uuid"
         every { NetworkUtils.getDeviceName(context) } returns "Bedroom"
         every { context.getSystemService(Context.NSD_SERVICE) } returns nsd
+        every { context.getSystemService(Context.CONNECTIVITY_SERVICE) } returns connectivity
+        every { context.getSystemService(Context.WIFI_SERVICE) } returns wifi
+        every { wifi.createMulticastLock(any()) } returns multicastLock
+        every { network.hashCode() } returns 101
+        every { replacementNetwork.hashCode() } returns 202
+        every { connectivity.registerDefaultNetworkCallback(capture(networkCallback)) } just Runs
+        every { connectivity.activeNetwork } returns network
+        every { connectivity.getLinkProperties(network) } returns lan("192.168.1.180/24")
+        every { responder.start() } returns true
         every { nsd.registerService(any(), any(), any()) } answers {
             registrations.add(firstArg<NsdServiceInfo>() to thirdArg<NsdManager.RegistrationListener>())
         }
-        service = MdnsService(context, { states.add(it) }, discoveryResponderFactory = { responder })
+        service = MdnsService(context, { states.add(it) }, discoveryResponderFactory = { onEnded ->
+            responderEnded = onEnded
+            responder
+        })
     }
 
-    @After
-    fun teardown() { unmockkAll() }
+    @After fun teardown() {
+        if (::service.isInitialized) service.stop()
+        shadowOf(Looper.getMainLooper()).idle()
+        unmockkAll()
+    }
+
+    private fun lan(cidr: String): LinkProperties {
+        val (host, prefix) = cidr.split("/", limit = 2)
+        val address = mockk<LinkAddress>()
+        every { address.address } returns InetAddress.getByName(host)
+        every { address.prefixLength } returns prefix.toInt()
+        return mockk<LinkProperties>().also { properties ->
+            every { properties.interfaceName } returns "wlan0"
+            every { properties.linkAddresses } returns listOf(address)
+        }
+    }
+
+    private fun startOnline(name: String? = null) {
+        service.start(name)
+        shadowOf(Looper.getMainLooper()).idleFor(400, TimeUnit.MILLISECONDS)
+    }
 
     private fun registered(index: Int, name: String? = null) {
         val (info, listener) = registrations[index]
@@ -52,7 +102,7 @@ class MdnsServiceTest {
 
     @Test
     fun `registration is serialized and only complete after both callbacks`() {
-        service.start()
+        startOnline()
         assertEquals(1, registrations.size)
         assertEquals("_raop._tcp", registrations[0].first.serviceType)
         assertFalse(states.contains(ProtocolState.ADVERTISING))
@@ -64,11 +114,12 @@ class MdnsServiceTest {
         registered(1)
         assertEquals(listOf(ProtocolState.ADVERTISING), states)
         verify(exactly = 1) { responder.activate("Bedroom", "021122334455@Bedroom") }
+        verify(exactly = 1) { multicastLock.acquire() }
     }
 
     @Test
     fun `duplicate start and callbacks cannot create duplicate registrations`() {
-        service.start()
+        startOnline()
         service.start()
         registered(0)
         registered(0)
@@ -80,7 +131,7 @@ class MdnsServiceTest {
 
     @Test
     fun `responder uses actual names after independent collisions`() {
-        service.start()
+        startOnline()
         registered(0, "021122334455@Bedroom (2)")
         registered(1, "Bedroom (3)")
         verify { responder.activate("Bedroom (3)", "021122334455@Bedroom (2)") }
@@ -88,18 +139,20 @@ class MdnsServiceTest {
 
     @Test
     fun `late callback after stop cannot register the next service`() {
-        service.start()
+        startOnline()
         service.stop()
         registered(0)
         assertEquals(1, registrations.size)
         assertEquals(ProtocolState.DISABLED, states.last())
         verify(exactly = 0) { responder.activate(any(), any()) }
+        verify(exactly = 1) { multicastLock.release() }
     }
 
     @Test
     fun `restart ignores prior generation callbacks`() {
-        service.start()
+        startOnline()
         service.restart("Living Room")
+        shadowOf(Looper.getMainLooper()).idleFor(400, TimeUnit.MILLISECONDS)
         registered(0)
         assertEquals(2, registrations.size)
         registered(1)
@@ -109,7 +162,7 @@ class MdnsServiceTest {
 
     @Test
     fun `stop unregisters second listener even when first unregister throws`() {
-        service.start()
+        startOnline()
         registered(0)
         registered(1)
         every { nsd.unregisterService(registrations[1].second) } throws IllegalArgumentException("gone")
@@ -120,10 +173,121 @@ class MdnsServiceTest {
 
     @Test
     fun `already active error is not treated as a successful advertisement`() {
-        service.start()
+        startOnline()
         registrations[0].second.onRegistrationFailed(registrations[0].first, NsdManager.FAILURE_ALREADY_ACTIVE)
         assertEquals(1, registrations.size)
         assertEquals(ProtocolState.ERROR, states.last())
         assertFalse(states.contains(ProtocolState.ADVERTISING))
+
+        shadowOf(Looper.getMainLooper()).idleFor(999, TimeUnit.MILLISECONDS)
+        assertEquals(1, registrations.size)
+        shadowOf(Looper.getMainLooper()).idleFor(1, TimeUnit.MILLISECONDS)
+        assertEquals(2, registrations.size)
+    }
+
+    @Test
+    fun `offline start waits and one Wi-Fi rejoin refreshes both advertisements`() {
+        every { connectivity.activeNetwork } returns null
+        service.start()
+        shadowOf(Looper.getMainLooper()).idleFor(5, TimeUnit.SECONDS)
+        assertTrue(registrations.isEmpty())
+        assertEquals(ProtocolState.ERROR, states.last())
+
+        every { connectivity.getLinkProperties(network) } returns lan("192.168.1.181/24")
+        networkCallback.captured.onAvailable(network)
+        networkCallback.captured.onLinkPropertiesChanged(network, lan("192.168.1.181/24"))
+        shadowOf(Looper.getMainLooper()).idleFor(400, TimeUnit.MILLISECONDS)
+        assertEquals(1, registrations.size)
+        registered(0)
+        registered(1)
+
+        networkCallback.captured.onLost(network)
+        assertEquals(ProtocolState.ERROR, states.last())
+        val oldRegistrationCount = registrations.size
+        networkCallback.captured.onAvailable(network)
+        networkCallback.captured.onLinkPropertiesChanged(network, lan("192.168.1.182/24"))
+        shadowOf(Looper.getMainLooper()).idleFor(400, TimeUnit.MILLISECONDS)
+        assertEquals(oldRegistrationCount + 1, registrations.size)
+        verify(atLeast = 1) { responder.stop() }
+    }
+
+    @Test
+    fun `unexpected responder termination schedules one bounded refresh`() {
+        startOnline()
+        registered(0)
+        registered(1)
+
+        responderEnded!!.invoke()
+        responderEnded!!.invoke()
+        shadowOf(Looper.getMainLooper()).idleFor(999, TimeUnit.MILLISECONDS)
+        assertEquals(2, registrations.size)
+        shadowOf(Looper.getMainLooper()).idleFor(1, TimeUnit.MILLISECONDS)
+        assertEquals(2, registrations.size)
+        verify(exactly = 2) { responder.start() }
+        assertFalse(states.contains(ProtocolState.ERROR))
+
+        service.stop()
+        shadowOf(Looper.getMainLooper()).idleFor(30, TimeUnit.SECONDS)
+        assertEquals(2, registrations.size)
+    }
+
+    @Test
+    fun `same address on a replacement Network refreshes stale advertisements`() {
+        startOnline()
+        registered(0)
+        registered(1)
+        val oldRegistrationCount = registrations.size
+
+        networkCallback.captured.onAvailable(replacementNetwork)
+        networkCallback.captured.onLinkPropertiesChanged(
+            replacementNetwork,
+            lan("192.168.1.180/24")
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(399, TimeUnit.MILLISECONDS)
+        assertEquals(oldRegistrationCount, registrations.size)
+        shadowOf(Looper.getMainLooper()).idleFor(1, TimeUnit.MILLISECONDS)
+        assertEquals(oldRegistrationCount + 1, registrations.size)
+        verify(atLeast = 1) { responder.stop() }
+    }
+
+    @Test
+    fun `silent NSD callback is timed out and retried`() {
+        startOnline()
+        assertEquals(1, registrations.size)
+
+        shadowOf(Looper.getMainLooper()).idleFor(4_999, TimeUnit.MILLISECONDS)
+        assertEquals(1, registrations.size)
+        shadowOf(Looper.getMainLooper()).idleFor(1, TimeUnit.MILLISECONDS)
+        assertEquals(ProtocolState.ERROR, states.last())
+        assertEquals(1, registrations.size)
+
+        shadowOf(Looper.getMainLooper()).idleFor(1, TimeUnit.SECONDS)
+        assertEquals(2, registrations.size)
+        registrations[0].second.onServiceRegistered(registrations[0].first)
+        assertEquals(2, registrations.size)
+    }
+
+    @Test
+    fun `supplemental responder startup failure is retried`() {
+        every { responder.start() } returnsMany listOf(false, true)
+        startOnline()
+        assertEquals(1, registrations.size)
+        registered(0)
+        registered(1)
+        assertEquals(ProtocolState.ADVERTISING, states.last())
+
+        shadowOf(Looper.getMainLooper()).idleFor(999, TimeUnit.MILLISECONDS)
+        assertEquals(2, registrations.size)
+        shadowOf(Looper.getMainLooper()).idleFor(1, TimeUnit.MILLISECONDS)
+        assertEquals(2, registrations.size)
+        verify(exactly = 2) { responder.start() }
+        verify(exactly = 1) { responder.activate("Bedroom", "021122334455@Bedroom") }
+    }
+
+    @Test
+    fun `LAN fingerprint ignores callback noise but detects IPv4 changes`() {
+        assertEquals("wlan0|192.168.1.180/24", MdnsService.lanFingerprint(lan("192.168.1.180/24")))
+        val noLan = lan("fe80::1/64")
+        assertNull(MdnsService.lanFingerprint(noLan))
     }
 }

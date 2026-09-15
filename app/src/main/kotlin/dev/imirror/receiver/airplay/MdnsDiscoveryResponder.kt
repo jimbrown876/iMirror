@@ -9,15 +9,18 @@ import java.net.MulticastSocket
 import java.net.NetworkInterface
 
 /** Supplemental complete answers using records learned from the local NSD daemon. */
-class MdnsDiscoveryResponder {
+class MdnsDiscoveryResponder(
+    private val onUnexpectedTermination: () -> Unit = {}
+) {
     private val cache = MdnsResponseCache()
     private var socket: MulticastSocket? = null
 
     @Synchronized
-    fun start() {
-        if (socket != null) return
-        val sock = MulticastSocket(null)
+    fun start(): Boolean {
+        if (socket != null) return true
+        var sock: MulticastSocket? = null
         try {
+            sock = MulticastSocket(null)
             sock.reuseAddress = true
             sock.bind(InetSocketAddress(5353))
             sock.timeToLive = 255
@@ -31,9 +34,11 @@ class MdnsDiscoveryResponder {
                 isDaemon = true
                 start()
             }
+            return true
         } catch (e: Exception) {
-            sock.close()
-            Logger.w("Supplemental mDNS unavailable; Android NSD remains active: ${e.message}")
+            sock?.close()
+            Logger.w("Supplemental mDNS failed to start: ${e.message}")
+            return false
         }
     }
 
@@ -79,7 +84,15 @@ class MdnsDiscoveryResponder {
             if (!sock.isClosed) Logger.w("Supplemental mDNS ended: ${e.message}")
         } finally {
             sock.close()
-            synchronized(this) { if (socket === sock) socket = null }
+            val endedUnexpectedly = synchronized(this) {
+                if (socket === sock) {
+                    socket = null
+                    true
+                } else {
+                    false
+                }
+            }
+            if (endedUnexpectedly) onUnexpectedTermination()
         }
     }
 

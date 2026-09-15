@@ -4,7 +4,21 @@ This GPL-3.0 personal fork retains upstream attribution and is based on
 `prat3ik/iMirror` main commit `9b52ce6d8bedb80ee557a5114d3cdbee4ab84f00`.
 It is not an Apple-certified receiver. No DRM bypass or paid service is included.
 
-## Current personal build: 1.0.5-personal (version code 6)
+## Current personal build: 1.0.6-personal (version code 7)
+
+- Keep an Android multicast lock for the receiver's advertising lifetime, wait for a usable LAN,
+  and automatically refresh only the mDNS advertisements after Wi-Fi loss/rejoin, address changes,
+  registration failure, or an unexpected supplemental-responder exit.
+- Preserve serialized RAOP/AirPlay registration and use generation checks plus bounded retry so
+  duplicate or stale callbacks cannot create duplicate advertisements or interrupt media sockets.
+- Send packet-loss recovery requests to the iPhone control port negotiated in type-96 SETUP,
+  retry one outstanding gap at a bounded cadence, and distinguish delivered requests from failures.
+- Give music-only ALAC a negotiated hard burst ceiling while priming only one hardware-minimum
+  buffer before playback. Re-prime after a real underrun and insert one silent frame for an expired
+  gap so packet loss does not delete time from the playback timeline.
+- Leave the AAC-ELD screen-mirroring queue and its low-latency start behavior unchanged.
+
+The version 1.0.5 pause, resume, and volume repairs below are retained:
 
 - Treat iPhone's stream-scoped type-96 TEARDOWN as pause: stop that audio stream while retaining
   the authenticated control, event, timing and FairPlay session for immediate same-session resume.
@@ -112,12 +126,14 @@ Version 1.0.5 removes that autonomous established-session expiry and preserves
 stream-scoped teardown state; both physical TVs still require the exact regression
 flow before this result can be called verified.
 
-Software audio queue budgets are approximately 140 ms on the realtime mirroring
-path and no more than roughly 225 ms for audio-only music burst recovery, not
-measured end-to-end latency. Neither path forces the queue to prefill, so healthy
-steady-state playback does not inherit that full capacity. The TCL hardware reports a roughly 144 ms minimum
-AudioTrack buffer and declines Android's FAST flag. Sender buffering, network,
-decoding, and hardware output add delay; no total-latency guarantee is made.
+Software audio queue budgets remain approximately 140 ms on the realtime mirroring
+path. Music-only packet storage is capped at about 100 ms, with a 75 ms bounded loss-recovery
+window. The Living Room TCL's measured output capacity is about 288 ms; the combined receiver
+budget reserves at least 25 ms below the 500 ms target. The sender's negotiated 250 ms minimum
+is honored when priming the AudioTrack, within its hardware capacity. On FLUSH/PAUSE the receiver
+discards old UDP packets, resumes from the sender's RTP boundary, and ends a session cleanly if
+the audio sink or decoder cannot recover. Sender buffering, network, decoding, and hardware
+output still add delay, so this is a bounded receiver budget rather than an end-to-end guarantee.
 
 Unsupported buffered-audio paths remain separate follow-up tests if they reproduce.
 HEVC and protected-video
