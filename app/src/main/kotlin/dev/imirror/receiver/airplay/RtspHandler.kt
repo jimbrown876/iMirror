@@ -17,6 +17,55 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 
+/** Transport negotiated by a type-96 AirPlay audio SETUP request. */
+data class RealtimeAudioSetup(
+    val sampleRate: Int,
+    val channels: Int,
+    val codecType: Int,
+    val framesPerPacket: Int,
+    val remoteAddress: java.net.InetAddress,
+    val senderControlPort: Int,
+    val latencyMinSamples: Int,
+    val latencyMaxSamples: Int,
+    /** Identifies the control socket that negotiated this stream; prevents stale sink failures. */
+    val sessionGeneration: Long = 0L
+) {
+    init {
+        require(sampleRate in 8_000..192_000) { "unsupported audio sample rate: $sampleRate" }
+        require(channels in 1..2) { "unsupported audio channel count: $channels" }
+        require(codecType in setOf(2, 4, 8)) { "unsupported realtime audio codec: $codecType" }
+        require(codecType == 2 || sampleRate in dev.imirror.receiver.airplay.handshake.AudioStreamServer.SUPPORTED_AAC_SAMPLE_RATES) {
+            "unsupported AAC sample rate: $sampleRate"
+        }
+        require(framesPerPacket in 64..4_096) { "invalid audio frames per packet: $framesPerPacket" }
+        require(senderControlPort in 0..65_535) { "invalid sender control port" }
+        val maximumLatency = sampleRate.toLong() * 10L
+        require(latencyMinSamples.toLong() in 0..maximumLatency) { "invalid minimum audio latency" }
+        require(latencyMaxSamples.toLong() in 0..maximumLatency) { "invalid maximum audio latency" }
+        require(latencyMaxSamples == 0 || latencyMaxSamples >= latencyMinSamples) {
+            "maximum audio latency precedes minimum"
+        }
+    }
+}
+
+/** First RTP packet that must survive an AirPlay FLUSH; older in-flight UDP data is discarded. */
+data class AudioFlushBoundary(val sequence: Int?, val timestamp: Long?)
+
+internal fun parseAudioFlushBoundary(value: String?): AudioFlushBoundary? {
+    if (value.isNullOrBlank()) return null
+    var sequence: Int? = null
+    var timestamp: Long? = null
+    value.split(';', ',').forEach { field ->
+        val key = field.substringBefore('=', "").trim().lowercase(java.util.Locale.ROOT)
+        val raw = field.substringAfter('=', "").trim()
+        when (key) {
+            "seq" -> sequence = raw.toIntOrNull()?.takeIf { it in 0..0xFFFF }
+            "rtptime" -> timestamp = raw.toLongOrNull()?.takeIf { it in 0..0xFFFF_FFFFL }
+        }
+    }
+    return if (sequence != null || timestamp != null) AudioFlushBoundary(sequence, timestamp) else null
+}
+
 /**
  * RtspHandler — Manages the RTSP session with the AirPlay sender (macOS).
  *
@@ -44,8 +93,8 @@ open class RtspHandler(
     ) -> Pair<Int, Int> = { _, _, _, _, _ -> 0 to 0 },
     /** AirPlay 2 mirror SETUP: start the video data server (type 110); returns its data port. */
     private val onMirrorStreamStart: (streamConnectionId: Long) -> Int = { 0 },
-    /** AirPlay 2 SETUP: start the audio server (type 96; ct 8 AAC-ELD mirror / 4 AAC-LC / 2 ALAC). spf = samples/frame. */
-    private val onMirrorAudioStart: (sampleRate: Int, channels: Int, codecType: Int, framesPerPacket: Int) -> Pair<Int, Int> = { _, _, _, _ -> 0 to 0 },
+    /** AirPlay 2 SETUP: start the realtime audio server with the sender's negotiated transport. */
+    private val onMirrorAudioStart: (RealtimeAudioSetup) -> Pair<Int, Int> = { 0 to 0 },
     /** AirPlay 2 mirror TEARDOWN of just the audio stream (type 96) — stop audio, keep video. */
     private val onMirrorAudioStop: () -> Unit = {},
     /** AirPlay 2 mirror TEARDOWN of just the video stream (type 110) — stop video, keep audio. */
@@ -55,7 +104,11 @@ open class RtspHandler(
     /** Stops the buffered audio-only stream (type 103 TEARDOWN). */
     private val onBufferedAudioStop: () -> Unit = {},
     /** Discards queued audio for FLUSH/PAUSE without ending the authenticated AirPlay session. */
-    private val onAudioFlush: () -> Unit = {},
+    private val onAudioFlush: (AudioFlushBoundary?) -> Unit = {},
+    /** Suspends realtime audio delivery while retaining the authenticated control session. */
+    private val onAudioPause: () -> Unit = {},
+    /** Resumes realtime audio at the sender's new RTP boundary. */
+    private val onAudioResume: (AudioFlushBoundary?) -> Unit = {},
     /** Sender volume change (AirPlay dB: −30…0, or ≤ −144 = mute) via SET_PARAMETER. */
     private val onVolume: (Float) -> Unit = {},
     /** Now-playing track metadata (DMAP) from SET_PARAMETER — any field may be null. */
@@ -99,6 +152,7 @@ open class RtspHandler(
 
     @Volatile
     private var activeClient: Socket? = null
+    private var activeClientGeneration = 0L
     private val clientLock = Any()
     @Volatile private var activeClientJob: Job? = null
     @Volatile private var activeClientEstablished = false
@@ -181,6 +235,36 @@ open class RtspHandler(
     }
 
     /**
+     * Ends only the current sender connection while keeping the receiver listening for an immediate
+     * clean reconnect. Used when a media sink dies and continuing would leave iOS falsely routed to
+     * a connected-but-silent session.
+     */
+    fun abortActiveSession(reason: String, expectedGeneration: Long? = null): Boolean {
+        val client = synchronized(clientLock) {
+            val current = activeClient?.takeUnless { it.isClosed }
+            if (current == null ||
+                (expectedGeneration != null && expectedGeneration != activeClientGeneration)) {
+                null
+            } else {
+                // Revoke this socket's token before close. Any SETUP callback already waiting to
+                // install replacement media on the same socket will fail its ownership check.
+                activeClientGeneration++
+                current
+            }
+        }
+        if (client == null) return false
+        Logger.e("Closing active AirPlay session: $reason")
+        runCatching { client.close() }
+            .onFailure { Logger.w("Unable to close failed AirPlay session: ${it.message}") }
+        return true
+    }
+
+    /** True only while the control socket that created a media server still owns the session. */
+    fun isActiveSession(generation: Long): Boolean = synchronized(clientLock) {
+        generation == activeClientGeneration && activeClient?.isClosed == false
+    }
+
+    /**
      * Binds the RTSP port with SO_REUSEADDR, retrying briefly if a just-stopped instance hasn't
      * released it yet. A quick service stop→start (the activity being destroyed and relaunched)
      * could otherwise fail with EADDRINUSE, leaving iMirror advertising over mDNS while port 7000
@@ -250,6 +334,7 @@ open class RtspHandler(
                     handleClient(clientSocket)
                 }
                 synchronized(clientLock) {
+                    activeClientGeneration++
                     activeClient = clientSocket
                     activeClientJob = job
                     activeClientEstablished = false
@@ -799,9 +884,24 @@ open class RtspHandler(
                         val ch = (stream["channels"] as? Long)?.toInt() ?: 2
                         val ct = (stream["ct"] as? Long)?.toInt() ?: 8   // 8 = AAC-ELD (mirror), 4 = AAC-LC, 2 = ALAC
                         val spf = (stream["spf"] as? Long)?.toInt() ?: 352   // ALAC frameLength (samples/frame)
-                        val (dataPort, controlPort) = onMirrorAudioStart(sr, ch, ct, spf)
+                        val senderControlPort = (stream["controlPort"] as? Long)
+                            ?.takeIf { it in 1L..65535L }?.toInt() ?: 0
+                        val remoteAddress = currentRemoteAddress
+                            ?: error("audio SETUP without remote address")
+                        val setup = RealtimeAudioSetup(
+                            sampleRate = sr,
+                            channels = ch,
+                            codecType = ct,
+                            framesPerPacket = spf,
+                            remoteAddress = remoteAddress,
+                            senderControlPort = senderControlPort,
+                            latencyMinSamples = (stream["latencyMin"] as? Long)?.toInt() ?: 0,
+                            latencyMaxSamples = (stream["latencyMax"] as? Long)?.toInt() ?: 0,
+                            sessionGeneration = synchronized(clientLock) { activeClientGeneration }
+                        )
+                        val (dataPort, controlPort) = onMirrorAudioStart(setup)
                         activeStreamTypes.add(96)
-                        Logger.i("audio stream type=96 (ct=$ct ${sr}Hz x$ch spf=$spf) dataPort=$dataPort controlPort=$controlPort")
+                        Logger.i("audio stream type=96 (ct=$ct ${sr}Hz x$ch spf=$spf senderCtrl=${senderControlPort > 0}) dataPort=$dataPort controlPort=$controlPort")
                         mapOf("type" to 96L, "dataPort" to dataPort.toLong(), "controlPort" to controlPort.toLong())
                     }
                     103 -> {
@@ -906,6 +1006,10 @@ open class RtspHandler(
     open fun handleRecordInternal(request: RtspRequest): RtspResponse {
         // AirPlay 2 mirroring has no ANNOUNCE/SDP — RECORD just acknowledges the session.
         if (isMirrorSession) {
+            val rtpInfo = request.headers.entries.firstOrNull {
+                it.key.equals("RTP-Info", ignoreCase = true)
+            }?.value
+            onAudioResume(parseAudioFlushBoundary(rtpInfo))
             Logger.i("RECORD (mirror session) — OK")
             return RtspResponse(
                 statusCode = 200, statusMessage = "OK",
@@ -1029,14 +1133,17 @@ open class RtspHandler(
 
     /** Handles FLUSH — macOS requests we discard buffered media data (seek/pause). */
     private fun handleFlush(request: RtspRequest): RtspResponse {
-        onAudioFlush()
+        val rtpInfo = request.headers.entries.firstOrNull {
+            it.key.equals("RTP-Info", ignoreCase = true)
+        }?.value
+        onAudioFlush(parseAudioFlushBoundary(rtpInfo))
         Logger.d("FLUSH received — queued audio discarded")
         return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
     }
 
     /** Handles PAUSE — suspends media delivery. Responds 200 OK; resume arrives as RECORD. */
     open fun handlePauseInternal(request: RtspRequest): RtspResponse {
-        onAudioFlush()
+        onAudioPause()
         Logger.d("PAUSE received — control session retained")
         return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
     }

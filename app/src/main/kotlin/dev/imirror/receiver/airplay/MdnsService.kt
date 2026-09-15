@@ -1,11 +1,18 @@
 package dev.imirror.receiver.airplay
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
+import android.os.Handler
+import android.os.Looper
 import dev.imirror.receiver.service.ProtocolState
 import dev.imirror.receiver.util.Logger
 import dev.imirror.receiver.util.NetworkUtils
+import java.net.Inet4Address
 
 /**
  * MdnsService — Advertises iMirror as an AirPlay 2 receiver on the local network.
@@ -50,12 +57,17 @@ class MdnsService(
      * which has a MAC address prefix and is not shown to users).
      */
     private val onActualNameRegistered: (String) -> Unit = {},
-    private val discoveryResponderFactory: () -> MdnsDiscoveryResponder = { MdnsDiscoveryResponder() }
+    private val discoveryResponderFactory: ((() -> Unit) -> MdnsDiscoveryResponder) = { onEnded ->
+        MdnsDiscoveryResponder(onEnded)
+    }
 ) {
 
     // Android's built-in mDNS manager — handles multicast registration
     private val nsdManager: NsdManager =
         context.getSystemService(Context.NSD_SERVICE) as NsdManager
+    private val connectivityManager: ConnectivityManager =
+        context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private val recoveryHandler = Handler(Looper.getMainLooper())
 
     // Listeners track registration state; held to enable unregistration later
     private var airPlayListener: NsdManager.RegistrationListener? = null
@@ -64,6 +76,17 @@ class MdnsService(
     private var generation = 0
     private var actualAirPlayName = ""
     private var actualRaopName = ""
+    private var multicastLock: WifiManager.MulticastLock? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var candidateNetwork: Network? = null
+    private var activeNetwork: Network? = null
+    private var activeNetworkFingerprint: String? = null
+    private var networkStateKnown = false
+    private var recoveryTask: Runnable? = null
+    private var responderRecoveryTask: Runnable? = null
+    private var registrationWatchdog: Runnable? = null
+    private var recoveryAttempt = 0
+    private var responderRecoveryAttempt = 0
 
     // Count of how many services have confirmed registration.
     // Only when both reach 2 do we emit ProtocolState.ADVERTISING.
@@ -101,34 +124,14 @@ class MdnsService(
             return
         }
         isStarted = true
-        generation++
-        registeredCount = 0
-        actualAirPlayName = ""
-        actualRaopName = ""
-
         val effectiveName = resolveDisplayName(displayNameOverride)
-        Logger.i("Starting mDNS advertising as '$effectiveName'")
+        Logger.i("Starting resilient mDNS advertising as '$effectiveName'")
         requestedName = effectiveName
         pendingName = effectiveName
-
-        // IMPORTANT: these two registrations MUST be serialised, not fired back-to-back.
-        // Android's NsdManager cannot have two registrations in flight at once — the second
-        // call silently cancels the first, with NEITHER onServiceRegistered nor
-        // onRegistrationFailed ever being invoked for the loser. Observed on Android 14:
-        // _raop registered fine while _airplay disappeared completely, which made the device
-        // invisible in the iOS Screen Mirroring menu (that menu keys off _airplay._tcp).
-        //
-        // So: register _raop first, and only chain _airplay once its callback has landed.
-        // Listen before NSD announces so supplemental answers reuse its exact SRV
-        // hostname, TXT data and address records. It answers only after registration.
-        discoveryResponder = discoveryResponderFactory().also { it.start() }
-        try {
-            registerRaopService(effectiveName)
-        } catch (e: Exception) {
-            Logger.e("Unable to start mDNS registration", e)
-            stop()
-            onStateChange(ProtocolState.ERROR)
-        }
+        recoveryAttempt = 0
+        responderRecoveryAttempt = 0
+        acquireMulticastLock()
+        startNetworkMonitoring()
     }
 
     /**
@@ -144,19 +147,10 @@ class MdnsService(
         Logger.i("Stopping mDNS advertising")
         isStarted = false
         generation++
-        discoveryResponder?.stop()
-        discoveryResponder = null
-        listOfNotNull(airPlayListener, raopListener).forEach { listener ->
-            try {
-                nsdManager.unregisterService(listener)
-            } catch (e: Exception) {
-                // Still unregister the other service if one listener was not active.
-                Logger.e("Error unregistering mDNS service (non-fatal)", e)
-            }
-        }
-        airPlayListener = null
-        raopListener = null
-        registeredCount = 0
+        cancelRecovery()
+        stopNetworkMonitoring()
+        clearAdvertisingResources()
+        releaseMulticastLock()
         onStateChange(ProtocolState.DISABLED)
     }
 
@@ -175,6 +169,268 @@ class MdnsService(
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────────
+
+    /**
+     * Starts one generation of the two serialized NSD registrations. The media sockets are not
+     * touched, so recovering discovery cannot interrupt an active AirPlay session.
+     */
+    @Synchronized
+    private fun beginAdvertising() {
+        if (!isStarted || activeNetworkFingerprint == null) return
+        generation++
+        clearAdvertisingResources()
+        registeredCount = 0
+        actualAirPlayName = ""
+        actualRaopName = ""
+        val advertisingGeneration = generation
+
+        // IMPORTANT: these two registrations MUST be serialised, not fired back-to-back.
+        // Android's NsdManager cannot reliably handle two registrations in flight at once.
+        // Listen before NSD announces so supplemental answers reuse its exact SRV hostname,
+        // TXT data and address records. It answers only after both registrations complete.
+        try {
+            startSupplementalResponder(advertisingGeneration)
+            registerRaopService(pendingName)
+            scheduleRegistrationWatchdog(advertisingGeneration)
+        } catch (e: Exception) {
+            handleAdvertisingFailure("registration start", e)
+        }
+    }
+
+    /** Release only advertising resources; keep the desired always-ready lifecycle alive. */
+    private fun clearAdvertisingResources() {
+        cancelRegistrationWatchdog()
+        cancelResponderRecovery()
+        discoveryResponder?.stop()
+        discoveryResponder = null
+        listOfNotNull(airPlayListener, raopListener).forEach { listener ->
+            try {
+                nsdManager.unregisterService(listener)
+            } catch (e: Exception) {
+                // A listener can already be gone after a Wi-Fi transition. Continue cleaning up.
+                Logger.w("Unable to unregister stale mDNS service: ${e.message}")
+            }
+        }
+        airPlayListener = null
+        raopListener = null
+        registeredCount = 0
+    }
+
+    /**
+     * Observe LAN identity, not merely process lifetime. Android can keep this foreground service
+     * alive while NSD registrations and multicast memberships become stale after Wi-Fi rejoins.
+     */
+    private fun startNetworkMonitoring() {
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                // Android guarantees LinkProperties after onAvailable for registered callbacks.
+                // Remember the candidate, but do not tear down a healthy registration because a
+                // race-prone synchronous getLinkProperties() lookup happens to return null.
+                synchronized(this@MdnsService) {
+                    if (isStarted) candidateNetwork = network
+                }
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                updateNetwork(network, linkProperties)
+            }
+
+            override fun onLost(network: Network) {
+                synchronized(this@MdnsService) {
+                    if (!isStarted) return
+                    if (candidateNetwork == network) candidateNetwork = null
+                    if (activeNetwork != network) return
+                    activeNetwork = null
+                    updateNetworkFingerprint(null)
+                }
+            }
+        }
+        networkCallback = callback
+        try {
+            connectivityManager.registerDefaultNetworkCallback(callback)
+            val network = connectivityManager.activeNetwork
+            updateNetwork(network, network?.let(connectivityManager::getLinkProperties))
+        } catch (e: Exception) {
+            // If the observer itself is unavailable, retain the old behavior with bounded retry.
+            Logger.w("Unable to monitor LAN changes; starting mDNS directly: ${e.message}")
+            activeNetworkFingerprint = FALLBACK_NETWORK
+            scheduleRecovery("network monitor unavailable", 0L, resetBackoff = true)
+        }
+    }
+
+    @Synchronized
+    private fun stopNetworkMonitoring() {
+        networkCallback?.let { callback ->
+            runCatching { connectivityManager.unregisterNetworkCallback(callback) }
+        }
+        networkCallback = null
+        candidateNetwork = null
+        activeNetwork = null
+        activeNetworkFingerprint = null
+        networkStateKnown = false
+    }
+
+    private fun updateNetwork(network: Network?, linkProperties: LinkProperties?) {
+        synchronized(this) {
+            if (!isStarted) return
+            if (network == null) {
+                updateNetworkFingerprint(null)
+                return
+            }
+            // Ignore a late properties callback from an older default network after a handoff.
+            val candidate = candidateNetwork
+            if (candidate != null && network != candidate && network != activeNetwork) return
+            val fingerprint = linkProperties?.let(::lanFingerprint)
+                ?.let { "${network.hashCode()}|$it" }
+            if (fingerprint != null) {
+                activeNetwork = network
+                if (candidateNetwork == network) candidateNetwork = null
+            }
+            updateNetworkFingerprint(fingerprint)
+        }
+    }
+
+    private fun updateNetworkFingerprint(fingerprint: String?) {
+        if (networkStateKnown && fingerprint == activeNetworkFingerprint) return
+        networkStateKnown = true
+        activeNetworkFingerprint = fingerprint
+        generation++
+        cancelRecovery()
+        clearAdvertisingResources()
+        if (fingerprint == null) {
+            Logger.i("LAN unavailable; mDNS recovery is waiting for a usable address")
+            onStateChange(ProtocolState.ERROR)
+            return
+        }
+        scheduleRecovery("LAN available or changed", NETWORK_DEBOUNCE_MS, resetBackoff = true)
+    }
+
+    private fun handleResponderEnded(listenerGeneration: Int) {
+        synchronized(this) {
+            if (!isStarted || generation != listenerGeneration) return
+            Logger.w("Supplemental mDNS responder ended unexpectedly")
+            discoveryResponder = null
+            scheduleResponderRecovery(listenerGeneration)
+        }
+    }
+
+    /** Android NSD remains the primary advertisement if the supplemental responder is unavailable. */
+    private fun startSupplementalResponder(responderGeneration: Int) {
+        val candidate = discoveryResponderFactory {
+            handleResponderEnded(responderGeneration)
+        }
+        if (candidate.start()) {
+            discoveryResponder = candidate
+            responderRecoveryAttempt = 0
+            if (registeredCount >= 2) candidate.activate(actualAirPlayName, actualRaopName)
+        } else {
+            discoveryResponder = null
+            scheduleResponderRecovery(responderGeneration)
+        }
+    }
+
+    @Synchronized
+    private fun scheduleResponderRecovery(responderGeneration: Int) {
+        if (!isStarted || generation != responderGeneration ||
+            activeNetworkFingerprint == null || responderRecoveryTask != null) return
+        val delayMs = RETRY_DELAYS_MS[
+            responderRecoveryAttempt.coerceAtMost(RETRY_DELAYS_MS.lastIndex)
+        ]
+        if (responderRecoveryAttempt < RETRY_DELAYS_MS.lastIndex) responderRecoveryAttempt++
+        lateinit var task: Runnable
+        task = Runnable {
+            synchronized(this) {
+                if (responderRecoveryTask !== task) return@Runnable
+                responderRecoveryTask = null
+                if (!isStarted || generation != responderGeneration ||
+                    activeNetworkFingerprint == null || discoveryResponder != null) return@Runnable
+                Logger.i("Retrying supplemental mDNS responder")
+                startSupplementalResponder(responderGeneration)
+            }
+        }
+        responderRecoveryTask = task
+        recoveryHandler.postDelayed(task, delayMs)
+    }
+
+    private fun cancelResponderRecovery() {
+        responderRecoveryTask?.let(recoveryHandler::removeCallbacks)
+        responderRecoveryTask = null
+    }
+
+    private fun handleAdvertisingFailure(reason: String, error: Throwable? = null) {
+        if (!isStarted) return
+        if (error != null) Logger.e("mDNS $reason failed", error)
+        else Logger.e("mDNS $reason failed")
+        generation++
+        clearAdvertisingResources()
+        onStateChange(ProtocolState.ERROR)
+        scheduleRecovery(reason)
+    }
+
+    @Synchronized
+    private fun scheduleRecovery(
+        reason: String,
+        requestedDelayMs: Long? = null,
+        resetBackoff: Boolean = false
+    ) {
+        if (!isStarted || activeNetworkFingerprint == null || recoveryTask != null) return
+        if (resetBackoff) recoveryAttempt = 0
+        val delayMs = requestedDelayMs ?: RETRY_DELAYS_MS[recoveryAttempt.coerceAtMost(RETRY_DELAYS_MS.lastIndex)]
+        if (requestedDelayMs == null && recoveryAttempt < RETRY_DELAYS_MS.lastIndex) recoveryAttempt++
+        lateinit var task: Runnable
+        task = Runnable {
+            synchronized(this) {
+                if (recoveryTask !== task || !isStarted || activeNetworkFingerprint == null) return@Runnable
+                recoveryTask = null
+                Logger.i("Refreshing mDNS advertising after $reason")
+                beginAdvertising()
+            }
+        }
+        recoveryTask = task
+        recoveryHandler.postDelayed(task, delayMs)
+    }
+
+    private fun cancelRecovery() {
+        recoveryTask?.let(recoveryHandler::removeCallbacks)
+        recoveryTask = null
+    }
+
+    private fun scheduleRegistrationWatchdog(watchdogGeneration: Int) {
+        cancelRegistrationWatchdog()
+        lateinit var watchdog: Runnable
+        watchdog = Runnable {
+            synchronized(this) {
+                if (registrationWatchdog !== watchdog) return@Runnable
+                registrationWatchdog = null
+                if (!isStarted || generation != watchdogGeneration || registeredCount >= 2) return@Runnable
+                handleAdvertisingFailure("registration callback timeout")
+            }
+        }
+        registrationWatchdog = watchdog
+        recoveryHandler.postDelayed(watchdog, REGISTRATION_TIMEOUT_MS)
+    }
+
+    private fun cancelRegistrationWatchdog() {
+        registrationWatchdog?.let(recoveryHandler::removeCallbacks)
+        registrationWatchdog = null
+    }
+
+    private fun acquireMulticastLock() {
+        if (multicastLock != null) return
+        runCatching {
+            val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifiManager.createMulticastLock(MULTICAST_LOCK_TAG).apply {
+                setReferenceCounted(false)
+                acquire()
+                multicastLock = this
+            }
+        }.onFailure { Logger.w("Unable to acquire mDNS multicast lock: ${it.message}") }
+    }
+
+    private fun releaseMulticastLock() {
+        multicastLock?.let { lock -> runCatching { lock.release() } }
+        multicastLock = null
+    }
 
     /**
      * Determines the effective name to advertise.
@@ -221,7 +477,7 @@ class MdnsService(
                 onActualNameRegistered(actualName)
             },
             onSuccess = { incrementAndCheckBothRegistered() },
-            onFailure = { onStateChange(ProtocolState.ERROR) }
+            onFailure = {}
         )
         nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, airPlayListener!!)
     }
@@ -264,8 +520,9 @@ class MdnsService(
                 incrementAndCheckBothRegistered()
                 // Only now is it safe to register the second service — see start().
                 registerAirPlayService(pendingName)
+                scheduleRegistrationWatchdog(generation)
             },
-            onFailure = { onStateChange(ProtocolState.ERROR) }
+            onFailure = {}
         )
         nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, raopListener!!)
     }
@@ -279,6 +536,8 @@ class MdnsService(
     private fun incrementAndCheckBothRegistered() {
         registeredCount++
         if (registeredCount >= 2) {
+            cancelRegistrationWatchdog()
+            recoveryAttempt = 0
             discoveryResponder?.activate(actualAirPlayName, actualRaopName)
             onStateChange(ProtocolState.ADVERTISING)
         }
@@ -316,8 +575,7 @@ class MdnsService(
                     Logger.i("mDNS registered: $serviceLabel as '${serviceInfo.serviceName}'")
                     onRegisteredName?.invoke(serviceInfo.serviceName)
                     try { onSuccess() } catch (e: Exception) {
-                        Logger.e("Unable to complete mDNS registration", e)
-                        stop()
+                        handleAdvertisingFailure("registration completion", e)
                         onFailure()
                     }
                 }
@@ -330,13 +588,19 @@ class MdnsService(
                     // FAILURE_ALREADY_ACTIVE is a failed operation, not proof of a
                     // successful registration under the requested service identity.
                     Logger.e("mDNS registration FAILED for $serviceLabel, errorCode=$errorCode")
-                    stop()
+                    handleAdvertisingFailure("registration for $serviceLabel (code $errorCode)")
                     onFailure()
                 }
             }
 
             override fun onServiceUnregistered(serviceInfo: NsdServiceInfo) {
-                Logger.d("mDNS unregistered: $serviceLabel")
+                synchronized(this@MdnsService) {
+                    if (!isStarted || generation != listenerGeneration) {
+                        Logger.d("mDNS unregistered: $serviceLabel")
+                        return
+                    }
+                    handleAdvertisingFailure("unexpected unregistration of $serviceLabel")
+                }
             }
 
             override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
@@ -367,5 +631,21 @@ class MdnsService(
 
         /** AirPlay server version — matches a real Apple TV for maximum compatibility. */
         private const val AIRPLAY_SERVER_VERSION = "220.68"
+
+        private const val MULTICAST_LOCK_TAG = "iMirror:AirPlayDiscovery"
+        private const val NETWORK_DEBOUNCE_MS = 400L
+        private const val REGISTRATION_TIMEOUT_MS = 5_000L
+        private const val FALLBACK_NETWORK = "network-monitor-fallback"
+        private val RETRY_DELAYS_MS = longArrayOf(1_000L, 2_000L, 5_000L, 10_000L, 30_000L)
+
+        internal fun lanFingerprint(linkProperties: LinkProperties): String? {
+            val addresses = linkProperties.linkAddresses.mapNotNull { linkAddress ->
+                val address = linkAddress.address as? Inet4Address ?: return@mapNotNull null
+                if (address.isLoopbackAddress || address.isLinkLocalAddress || address.isAnyLocalAddress) null
+                else "${address.hostAddress}/${linkAddress.prefixLength}"
+            }.sorted()
+            if (addresses.isEmpty()) return null
+            return "${linkProperties.interfaceName.orEmpty()}|${addresses.joinToString(",")}"
+        }
     }
 }
