@@ -663,9 +663,9 @@ class AudioStreamServer(
     // the playback thread. Bounded so a stalled player can't grow latency unboundedly — if it fills
     // we drop the oldest frame (a brief glitch is better than ever-growing audio lag).
     private val packetFrames = when (codecType) { CT_AAC_ELD -> 480; CT_AAC_LC -> 1024; else -> framesPerPacket }
-    // Mirroring retains the original tight budget. Music-only streams retain a bounded negotiated
-    // recovery window because these TCL radios can fall below -70 dBm. Capacity is a ceiling, not
-    // forced prebuffer; [MusicPlayoutPolicy] controls the much smaller normal startup target.
+    // Mirroring retains the original tight budget. Music-only storage honors the sender's bounded
+    // latencyMax window so a recovered Wi-Fi burst is not discarded after the radio catches up.
+    // Capacity is only a ceiling: [MusicPlayoutPolicy] still controls the small startup prime.
     private val frameQueue = ArrayBlockingQueue<QueuedAudioFrame>(
         queueCapacityPackets(codecType, sampleRate, packetFrames, latencyMaxSamples)
     )
@@ -1336,8 +1336,9 @@ class AudioStreamServer(
         /**
          * Hard storage ceiling for packet bursts. Music capacity does not prebuffer this amount;
          * normal start latency is controlled separately by [MusicPlayoutPolicy]. When the sender
-         * supplies a very large latencyMax, keep it subordinate to the receiver's low-latency
-         * contract instead of allowing seconds of stale audio to accumulate.
+         * supplies a very large latencyMax, retain at most the AirPlay music ceiling. Unlike a
+         * forced prebuffer, this storage adds no normal startup delay; it is used only when a weak
+         * radio delivers a catch-up burst after a gap.
          */
         internal fun queueCapacityPackets(
             codecType: Int,
@@ -1353,19 +1354,19 @@ class AudioStreamServer(
             } else {
                 sampleRate.toLong() * MAX_MUSIC_QUEUE_MILLIS / (frames.toLong() * 1_000L)
             }
-            val maximumPackets = packetBudget(
-                sampleRate, frames, MAX_MUSIC_QUEUE_MILLIS, maximumPackets = MAX_MUSIC_QUEUE_PACKETS
-            )
+            val maximumPackets = ((sampleRate.toLong() * MAX_MUSIC_QUEUE_MILLIS +
+                frames.toLong() * 1_000L - 1L) / (frames.toLong() * 1_000L))
+                .coerceAtMost(MAX_MUSIC_QUEUE_PACKETS.toLong()).toInt()
             val minimumPackets = minOf(MIN_MUSIC_QUEUE_PACKETS, maximumPackets)
             return negotiated.coerceIn(minimumPackets.toLong(), maximumPackets.toLong()).toInt()
         }
 
-        internal const val MAX_MUSIC_QUEUE_MILLIS = 100
+        internal const val MAX_MUSIC_QUEUE_MILLIS = 2_000
         internal const val MUSIC_REORDER_MILLIS = 75
         internal const val OUTPUT_CAPACITY_BUDGET_MILLIS = 288
-        internal const val LOW_LATENCY_CONTRACT_MILLIS = 500
+        internal const val LOW_LATENCY_CONTRACT_MILLIS = 2_500
         internal const val REQUIRED_PIPELINE_HEADROOM_MILLIS = 25
-        private const val MAX_MUSIC_QUEUE_PACKETS = 16
+        private const val MAX_MUSIC_QUEUE_PACKETS = 256
         private const val MIN_MUSIC_QUEUE_PACKETS = 4
         private const val PLAYBACK_STOP_TIMEOUT_MS = 500L
         internal val SUPPORTED_AAC_SAMPLE_RATES = setOf(

@@ -266,7 +266,7 @@ class AudioBufferingTest {
         }
 
         assertEquals(
-            12,
+            251,
             AudioStreamServer.queueCapacityPackets(
                 AudioStreamServer.CT_ALAC, 44100, 352, latencyMaxSamples = 88200
             )

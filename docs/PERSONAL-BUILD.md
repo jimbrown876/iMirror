@@ -4,7 +4,18 @@ This GPL-3.0 personal fork retains upstream attribution and is based on
 `prat3ik/iMirror` main commit `9b52ce6d8bedb80ee557a5114d3cdbee4ab84f00`.
 It is not an Apple-certified receiver. No DRM bypass or paid service is included.
 
-## Current personal build: 1.0.7-personal (version code 8)
+## Current personal build: 1.0.8-personal (version code 9)
+
+- Answer supplemental mDNS queries over both IPv4 and IPv6, and refresh advertisements when a
+  preferred IPv6 privacy address rotates. This removes stale endpoint selection from the phone's
+  tap-to-connect path without restarting media sockets.
+- Hold Android's high-performance Wi-Fi mode while the receiver is enabled. Music storage now
+  honors the sender's negotiated latency maximum, so a recovered 2.4 GHz/Bluetooth contention
+  burst is played in order instead of overflowing the short realtime queue and skipping ahead.
+- Keep normal music startup at the sender's 250 ms minimum; the larger queue is bounded catch-up
+  capacity, not a forced two-second prebuffer. Mirroring keeps its existing tight queue.
+
+The version 1.0.7 recovery repair below is retained:
 
 - Preserve every missing packet interval inside the bounded music recovery window after resend
   retries expire. This prevents a short unrecoverable Wi-Fi burst from deleting time and making
@@ -133,10 +144,11 @@ stream-scoped teardown state; both physical TVs still require the exact regressi
 flow before this result can be called verified.
 
 Software audio queue budgets remain approximately 140 ms on the realtime mirroring
-path. Music-only packet storage is capped at about 100 ms, with a 75 ms bounded loss-recovery
-window. The Living Room TCL's measured output capacity is about 288 ms; the combined receiver
-budget reserves at least 25 ms below the 500 ms target. The sender's negotiated 250 ms minimum
-is honored when priming the AudioTrack, within its hardware capacity. On FLUSH/PAUSE the receiver
+path. Music-only packet storage is capped by the sender's negotiated maximum and a two-second
+receiver ceiling, with a 75 ms bounded loss-recovery window. The Living Room TCL's measured output
+capacity is about 288 ms, and normal startup still primes to the sender's negotiated 250 ms minimum.
+The larger software queue is catch-up storage after a Wi-Fi burst; it is not filled before normal
+playback. On FLUSH/PAUSE the receiver
 discards old UDP packets, resumes from the sender's RTP boundary, and ends a session cleanly if
 the audio sink or decoder cannot recover. Sender buffering, network, decoding, and hardware
 output still add delay, so this is a bounded receiver budget rather than an end-to-end guarantee.

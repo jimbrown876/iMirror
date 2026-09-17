@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Answer mDNS queries over IPv4 and IPv6, and refresh advertisements when IPv6 privacy addresses
+  rotate, avoiding a long picker-to-connection delay caused by stale receiver endpoints.
+- Keep the TV Wi-Fi radio in high-performance mode while the receiver is enabled, and retain audio
+  catch-up bursts inside the sender's negotiated two-second music window instead of dropping them
+  from the short realtime queue during Bluetooth/2.4 GHz contention.
 - Preserve every missing packet interval inside the negotiated music recovery window after resend
   retries expire, preventing a short unrecoverable Wi-Fi burst from compressing the song timeline
   and sounding like repeated skips.

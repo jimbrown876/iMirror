@@ -9,10 +9,12 @@ import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Handler
 import android.os.Looper
+import android.system.OsConstants
 import dev.imirror.receiver.service.ProtocolState
 import dev.imirror.receiver.util.Logger
 import dev.imirror.receiver.util.NetworkUtils
 import java.net.Inet4Address
+import java.net.Inet6Address
 
 /**
  * MdnsService — Advertises iMirror as an AirPlay 2 receiver on the local network.
@@ -77,6 +79,7 @@ class MdnsService(
     private var actualAirPlayName = ""
     private var actualRaopName = ""
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var wifiPerformanceLock: WifiManager.WifiLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var candidateNetwork: Network? = null
     private var activeNetwork: Network? = null
@@ -131,6 +134,7 @@ class MdnsService(
         recoveryAttempt = 0
         responderRecoveryAttempt = 0
         acquireMulticastLock()
+        acquireWifiPerformanceLock()
         startNetworkMonitoring()
     }
 
@@ -150,6 +154,7 @@ class MdnsService(
         cancelRecovery()
         stopNetworkMonitoring()
         clearAdvertisingResources()
+        releaseWifiPerformanceLock()
         releaseMulticastLock()
         onStateChange(ProtocolState.DISABLED)
     }
@@ -432,6 +437,25 @@ class MdnsService(
         multicastLock = null
     }
 
+    /** Keep the plugged-in TV radio out of power save while it is an active LAN receiver. */
+    @Suppress("DEPRECATION")
+    private fun acquireWifiPerformanceLock() {
+        if (wifiPerformanceLock != null) return
+        runCatching {
+            val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, WIFI_LOCK_TAG).apply {
+                setReferenceCounted(false)
+                acquire()
+                wifiPerformanceLock = this
+            }
+        }.onFailure { Logger.w("Unable to acquire AirPlay Wi-Fi performance lock: ${it.message}") }
+    }
+
+    private fun releaseWifiPerformanceLock() {
+        wifiPerformanceLock?.let { lock -> runCatching { lock.release() } }
+        wifiPerformanceLock = null
+    }
+
     /**
      * Determines the effective name to advertise.
      * Uses [override] if non-blank; otherwise reads from the Android system.
@@ -633,6 +657,7 @@ class MdnsService(
         private const val AIRPLAY_SERVER_VERSION = "220.68"
 
         private const val MULTICAST_LOCK_TAG = "iMirror:AirPlayDiscovery"
+        private const val WIFI_LOCK_TAG = "iMirror:AirPlayTransport"
         private const val NETWORK_DEBOUNCE_MS = 400L
         private const val REGISTRATION_TIMEOUT_MS = 5_000L
         private const val FALLBACK_NETWORK = "network-monitor-fallback"
@@ -640,9 +665,17 @@ class MdnsService(
 
         internal fun lanFingerprint(linkProperties: LinkProperties): String? {
             val addresses = linkProperties.linkAddresses.mapNotNull { linkAddress ->
-                val address = linkAddress.address as? Inet4Address ?: return@mapNotNull null
-                if (address.isLoopbackAddress || address.isLinkLocalAddress || address.isAnyLocalAddress) null
-                else "${address.hostAddress}/${linkAddress.prefixLength}"
+                val address = linkAddress.address
+                val unusableFlags = OsConstants.IFA_F_DADFAILED or OsConstants.IFA_F_DEPRECATED or
+                    OsConstants.IFA_F_OPTIMISTIC or OsConstants.IFA_F_TENTATIVE
+                if ((linkAddress.flags and unusableFlags) != 0 || address.isLoopbackAddress ||
+                    address.isAnyLocalAddress || address.isMulticastAddress) return@mapNotNull null
+                when (address) {
+                    is Inet4Address -> if (address.isLinkLocalAddress) null
+                        else "4:${address.hostAddress}/${linkAddress.prefixLength}"
+                    is Inet6Address -> "6:${address.hostAddress}/${linkAddress.prefixLength}"
+                    else -> null
+                }
             }.sorted()
             if (addresses.isEmpty()) return null
             return "${linkProperties.interfaceName.orEmpty()}|${addresses.joinToString(",")}"

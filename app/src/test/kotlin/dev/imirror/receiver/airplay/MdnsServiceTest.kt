@@ -9,6 +9,7 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Looper
+import android.system.OsConstants
 import dev.imirror.receiver.service.ProtocolState
 import dev.imirror.receiver.util.NetworkUtils
 import io.mockk.Runs
@@ -38,6 +39,7 @@ class MdnsServiceTest {
     private val connectivity = mockk<ConnectivityManager>(relaxed = true)
     private val wifi = mockk<WifiManager>(relaxed = true)
     private val multicastLock = mockk<WifiManager.MulticastLock>(relaxed = true)
+    private val wifiPerformanceLock = mockk<WifiManager.WifiLock>(relaxed = true)
     private val network = mockk<Network>()
     private val replacementNetwork = mockk<Network>()
     private val responder = mockk<MdnsDiscoveryResponder>(relaxed = true)
@@ -57,6 +59,7 @@ class MdnsServiceTest {
         every { context.getSystemService(Context.CONNECTIVITY_SERVICE) } returns connectivity
         every { context.getSystemService(Context.WIFI_SERVICE) } returns wifi
         every { wifi.createMulticastLock(any()) } returns multicastLock
+        every { wifi.createWifiLock(any<Int>(), any()) } returns wifiPerformanceLock
         every { network.hashCode() } returns 101
         every { replacementNetwork.hashCode() } returns 202
         every { connectivity.registerDefaultNetworkCallback(capture(networkCallback)) } just Runs
@@ -78,14 +81,20 @@ class MdnsServiceTest {
         unmockkAll()
     }
 
-    private fun lan(cidr: String): LinkProperties {
-        val (host, prefix) = cidr.split("/", limit = 2)
-        val address = mockk<LinkAddress>()
-        every { address.address } returns InetAddress.getByName(host)
-        every { address.prefixLength } returns prefix.toInt()
+    private fun lan(cidr: String): LinkProperties = lanWithFlags(cidr to 0)
+
+    private fun lanWithFlags(vararg entries: Pair<String, Int>): LinkProperties {
+        val addresses = entries.map { (cidr, flags) ->
+            val (host, prefix) = cidr.split("/", limit = 2)
+            mockk<LinkAddress>().also { address ->
+                every { address.address } returns InetAddress.getByName(host)
+                every { address.prefixLength } returns prefix.toInt()
+                every { address.flags } returns flags
+            }
+        }
         return mockk<LinkProperties>().also { properties ->
             every { properties.interfaceName } returns "wlan0"
-            every { properties.linkAddresses } returns listOf(address)
+            every { properties.linkAddresses } returns addresses
         }
     }
 
@@ -115,6 +124,7 @@ class MdnsServiceTest {
         assertEquals(listOf(ProtocolState.ADVERTISING), states)
         verify(exactly = 1) { responder.activate("Bedroom", "021122334455@Bedroom") }
         verify(exactly = 1) { multicastLock.acquire() }
+        verify(exactly = 1) { wifiPerformanceLock.acquire() }
     }
 
     @Test
@@ -146,6 +156,7 @@ class MdnsServiceTest {
         assertEquals(ProtocolState.DISABLED, states.last())
         verify(exactly = 0) { responder.activate(any(), any()) }
         verify(exactly = 1) { multicastLock.release() }
+        verify(exactly = 1) { wifiPerformanceLock.release() }
     }
 
     @Test
@@ -285,9 +296,41 @@ class MdnsServiceTest {
     }
 
     @Test
-    fun `LAN fingerprint ignores callback noise but detects IPv4 changes`() {
-        assertEquals("wlan0|192.168.1.180/24", MdnsService.lanFingerprint(lan("192.168.1.180/24")))
-        val noLan = lan("fe80::1/64")
-        assertNull(MdnsService.lanFingerprint(noLan))
+    fun `LAN fingerprint tracks usable IPv4 and IPv6 address rotation`() {
+        assertEquals("wlan0|4:192.168.1.180/24", MdnsService.lanFingerprint(lan("192.168.1.180/24")))
+
+        val linkLocal = requireNotNull(MdnsService.lanFingerprint(lan("fe80::1/64")))
+        assertTrue(linkLocal.startsWith("wlan0|6:"))
+
+        val before = MdnsService.lanFingerprint(lanWithFlags(
+            "192.168.1.180/24" to 0,
+            "2603:1::10/64" to 0
+        ))
+        val after = MdnsService.lanFingerprint(lanWithFlags(
+            "192.168.1.180/24" to 0,
+            "2603:1::10/64" to OsConstants.IFA_F_DEPRECATED,
+            "2603:1::11/64" to 0
+        ))
+        assertNotEquals(before, after)
+        assertFalse(requireNotNull(after).contains("0:0:0:10/64"))
+    }
+
+    @Test
+    fun `subnet matching supports IPv6 and rejects cross-family addresses`() {
+        assertTrue(sameIpSubnet(
+            InetAddress.getByName("fe80::1234"),
+            InetAddress.getByName("fe80::5678"),
+            64
+        ))
+        assertFalse(sameIpSubnet(
+            InetAddress.getByName("fe80::1234"),
+            InetAddress.getByName("fe81::5678"),
+            64
+        ))
+        assertFalse(sameIpSubnet(
+            InetAddress.getByName("192.168.1.10"),
+            InetAddress.getByName("fe80::10"),
+            64
+        ))
     }
 }
