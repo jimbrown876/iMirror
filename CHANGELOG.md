@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Answer mDNS queries over IPv4 and IPv6, and refresh advertisements when IPv6 privacy addresses
+  rotate, avoiding a long picker-to-connection delay caused by stale receiver endpoints.
+- Keep the TV Wi-Fi radio in high-performance mode while the receiver is enabled, and retain audio
+  catch-up bursts inside the sender's negotiated two-second music window instead of dropping them
+  from the short realtime queue during Bluetooth/2.4 GHz contention.
+- Preserve every missing packet interval inside the negotiated music recovery window after resend
+  retries expire, preventing a short unrecoverable Wi-Fi burst from compressing the song timeline
+  and sounding like repeated skips.
+- Preserve the authenticated AirPlay control session when iOS pauses music by tearing down only
+  its type-96 audio stream, allowing a same-session SETUP to resume without losing FairPlay keys.
+- Flush queued PCM, RTP reorder, duplicate, decoder and AudioTrack state on FLUSH/PAUSE so stale
+  audio and sequence numbers cannot poison resumed playback.
+- Apply AirPlay volume directly to PCM16 samples on both audio paths, avoiding TCL vendor
+  per-track mixer behavior while keeping the existing low-latency buffers.
+- Keep selected but quiet routes alive through pauses and media-app switches until socket/session
+  teardown, while retaining bounded stale-sender replacement when another phone connects.
+- Retain same-session artwork and metadata across a pause so resume does not depend on the sender
+  retransmitting the current track immediately.
+
 ---
 
 ## [1.0.0-beta.1] - 2026-06-14

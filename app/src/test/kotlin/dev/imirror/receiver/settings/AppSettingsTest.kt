@@ -44,8 +44,8 @@ class AppSettingsTest {
     }
 
     @Test
-    fun `default settings have start on boot disabled`() {
-        assertFalse(AppSettings.DEFAULT.startOnBoot)
+    fun `default settings keep the receiver available after boot`() {
+        assertTrue(AppSettings.DEFAULT.startOnBoot)
     }
 
     @Test

@@ -98,6 +98,7 @@ class MirrorStreamServer(
                 }
                 val payload = ByteArray(payloadSize)
                 if (!readFully(input, payload, payloadSize)) break
+                StreamStats.markMediaPacket()
                 when (payloadType) {
                     0 -> {
                         // ALWAYS advance the AES-CTR keystream, in order, for every video payload —

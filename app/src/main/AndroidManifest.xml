@@ -14,6 +14,8 @@
     CHANGE_WIFI_STATE           — required by WifiP2pManager for Miracast Wi-Fi Direct
     ACCESS_FINE_LOCATION        — required by Wi-Fi P2P / Miracast discovery on Android 10+
     RECEIVE_BOOT_COMPLETED      — required for "start on boot" feature
+    SYSTEM_ALERT_WINDOW        — user-granted permission for opening playback from background
+    WAKE_LOCK                  — service-owned CPU/Wi-Fi locks while the receiver is enabled
 
     Explicitly NOT requested:
     - RECORD_AUDIO      (we receive audio, we do not record it)
@@ -34,6 +36,8 @@
 
     <!-- Start on boot -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Foreground service notification (Android 13+ requires runtime grant) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -117,6 +121,7 @@
         <service
             android:name=".service.MirrorService"
             android:foregroundServiceType="connectedDevice"
+            android:stopWithTask="false"
             android:exported="false" />
 
         <!--
@@ -129,6 +134,7 @@
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 

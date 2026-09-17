@@ -8,6 +8,7 @@ import dev.imirror.receiver.util.Logger
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import kotlin.math.roundToInt
 
 /**
  * AudioPlayer — Decrypts and plays the AirPlay audio stream.
@@ -153,6 +154,11 @@ class AudioPlayer {
                 out ?: return
             } ?: decryptedPayload
 
+            // Apply sender volume to the samples themselves. TCL's Android mixer can report an
+            // AudioTrack gain change without changing the audible output path; software gain makes
+            // phone-volume behavior deterministic while retaining the same low-latency buffers.
+            applyPcm16LeGainInPlace(pcm, volumeGain)
+
             // Step 4: Write to AudioTrack for playback
             // WRITE_NON_BLOCKING returns immediately if the buffer is full (prevents stalls)
             val track = audioTrack ?: return
@@ -201,7 +207,19 @@ class AudioPlayer {
     fun setVolume(airplayVolume: Float) {
         if (!airplayVolume.isFinite()) return
         volumeGain = airplayVolumeGain(airplayVolume)
-        audioTrack?.setVolume(volumeGain)
+    }
+
+    /** Clears queued/driver audio without releasing the live AirPlay session or decoder. */
+    @Synchronized
+    fun flush() {
+        pendingPcm?.clear()
+        val track = audioTrack ?: return
+        runCatching {
+            val resume = track.playState == AudioTrack.PLAYSTATE_PLAYING
+            if (resume) track.pause()
+            track.flush()
+            if (resume) track.play()
+        }.onFailure { Logger.w("AudioPlayer flush failed (non-fatal): ${it.message}") }
     }
 
     /**
@@ -272,7 +290,9 @@ class AudioPlayer {
             }
             .build()
 
-        audioTrack!!.setVolume(volumeGain)
+        // Sender gain is applied directly to PCM samples; keep the platform track at unity so a
+        // vendor mixer cannot ignore, reshape, or double-apply the AirPlay volume.
+        audioTrack!!.setVolume(1f)
         audioTrack!!.play()
         Logger.d("AudioTrack initialized: ${sampleRate}Hz, $channels ch, buffer=$bufferSize bytes")
     }
@@ -340,6 +360,11 @@ internal class PcmWriteQueue(private val capacity: Int, private val frameBytes: 
     internal var pendingBytes = 0
         private set
 
+    fun clear() {
+        chunks.clear()
+        pendingBytes = 0
+    }
+
     fun enqueueAndDrain(pcm: ByteArray, write: (ByteArray, Int, Int) -> Int) {
         require(frameBytes > 0 && capacity >= frameBytes)
         if (pcm.isNotEmpty()) {
@@ -390,3 +415,25 @@ internal fun audioRtpPayloadRange(data: ByteArray, offset: Int, length: Int): In
 /** AirPlay SET_PARAMETER volume is dB; AudioTrack takes linear amplitude, not slider percentage. */
 internal fun airplayVolumeGain(decibels: Float): Float =
     if (decibels <= -144f) 0f else Math.pow(10.0, decibels.coerceIn(-30f, 0f).toDouble() / 20.0).toFloat()
+
+/** Applies a clamped gain to signed 16-bit little-endian PCM in place. */
+internal fun applyPcm16LeGainInPlace(pcm: ByteArray, gain: Float): ByteArray {
+    require(pcm.size % 2 == 0) { "PCM16 data must contain complete samples" }
+    require(gain.isFinite()) { "PCM gain must be finite" }
+    val applied = gain.coerceIn(0f, 1f)
+    if (applied == 1f || pcm.isEmpty()) return pcm
+    if (applied == 0f) {
+        pcm.fill(0)
+        return pcm
+    }
+    var offset = 0
+    while (offset < pcm.size) {
+        val sample = (((pcm[offset + 1].toInt() and 0xFF) shl 8) or
+            (pcm[offset].toInt() and 0xFF)).toShort().toInt()
+        val scaled = (sample * applied).roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+        pcm[offset] = scaled.toByte()
+        pcm[offset + 1] = (scaled ushr 8).toByte()
+        offset += 2
+    }
+    return pcm
+}

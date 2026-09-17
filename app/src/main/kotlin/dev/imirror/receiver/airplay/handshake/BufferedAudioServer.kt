@@ -1,5 +1,6 @@
 package dev.imirror.receiver.airplay.handshake
 
+import dev.imirror.receiver.airplay.StreamStats
 import dev.imirror.receiver.util.Logger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -53,6 +54,7 @@ class BufferedAudioServer {
             while (running) {
                 val n = input.read(buf)
                 if (n < 0) break
+                StreamStats.markMediaPacket()
                 totalBytes += n
                 // Log the framing of the first few reads (length prefix / RTP header / payload).
                 if (reads < 12) {

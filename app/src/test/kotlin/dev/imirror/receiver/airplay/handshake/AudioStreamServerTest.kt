@@ -1,6 +1,7 @@
 package dev.imirror.receiver.airplay.handshake
 
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -34,5 +35,16 @@ class AudioStreamServerTest {
             byteArrayOf(0xF8.toByte(), 0xE6.toByte(), 0x30.toByte(), 0x00.toByte()),
             AudioStreamServer.buildAacEldAsc(48000, 1)
         )
+    }
+
+
+    @Test
+    fun `AAC ASC rejects a sample rate it cannot encode`() {
+        try {
+            AudioStreamServer.buildAacLcAsc(48_001, 2)
+            throw AssertionError("Expected unsupported sample rate")
+        } catch (expected: IllegalArgumentException) {
+            assertTrue(expected.message.orEmpty().contains("sample rate"))
+        }
     }
 }

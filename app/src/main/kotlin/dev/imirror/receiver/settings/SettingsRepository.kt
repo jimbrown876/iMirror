@@ -2,6 +2,7 @@ package dev.imirror.receiver.settings
 
 import android.content.Context
 import androidx.datastore.core.DataStore
+import androidx.datastore.core.DataMigration
 import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
@@ -16,7 +17,32 @@ import kotlinx.coroutines.flow.map
 // Extension property: creates a single DataStore instance per Context.
 // The name "imirror_settings" is the file name for the preferences store.
 private val Context.dataStore: DataStore<Preferences>
-        by preferencesDataStore(name = "imirror_settings")
+        by preferencesDataStore(
+            name = "imirror_settings",
+            produceMigrations = { listOf(AlwaysReadyBootMigration) }
+        )
+
+/** Apply Jim's requested unattended-start upgrade once, then preserve later user choices. */
+internal object AlwaysReadyBootMigration : DataMigration<Preferences> {
+    private val applied = booleanPreferencesKey("always_ready_boot_migration_v1")
+    private val startOnBoot = booleanPreferencesKey("start_on_boot")
+
+    override suspend fun shouldMigrate(currentData: Preferences): Boolean = currentData[applied] != true
+
+    override suspend fun migrate(currentData: Preferences): Preferences {
+        if (currentData[applied] == true) return currentData
+        return currentData.toMutablePreferences().apply {
+            this[startOnBoot] = true
+            this[applied] = true
+        }
+    }
+
+    override suspend fun cleanUp() = Unit
+
+    fun markApplied(preferences: MutablePreferences) {
+        preferences[applied] = true
+    }
+}
 
 /**
  * SettingsRepository — Persists and reads [AppSettings] using Android DataStore.
@@ -91,6 +117,7 @@ class SettingsRepository(private val context: Context) {
         try {
             context.dataStore.edit { prefs ->
                 prefs.clear()
+                AlwaysReadyBootMigration.markApplied(prefs)
             }
             Logger.i("Settings reset to defaults")
         } catch (e: Exception) {
@@ -119,6 +146,8 @@ class SettingsRepository(private val context: Context) {
      * Called inside a DataStore edit transaction.
      */
     private fun MutablePreferences.fromAppSettings(settings: AppSettings) {
+        // Explicit settings writes, including a future opt-out, must never be re-migrated.
+        AlwaysReadyBootMigration.markApplied(this)
         this[Keys.DISPLAY_NAME]         = settings.displayName
         this[Keys.AIRPLAY_ENABLED]      = settings.airPlayEnabled
         this[Keys.AIRPLAY_PIN_AUTH]     = settings.airPlayPinAuthEnabled

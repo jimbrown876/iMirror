@@ -9,16 +9,22 @@ import dev.imirror.receiver.airplay.handshake.MirrorStreamServer
 import dev.imirror.receiver.service.ProtocolState
 import dev.imirror.receiver.util.Logger
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * AirPlayReceiver — Top-level orchestrator for the AirPlay 2 receiver pipeline.
@@ -87,7 +93,9 @@ class AirPlayReceiver(
     /**
      * Audio-only "now playing" state. Emits a [NowPlayingInfo] when audio is streaming WITHOUT video
      * (system audio, Apple Music, podcasts) so the UI can show a now-playing card instead of a black
-     * surface; emits null when video is mirroring (the video screen takes over) or audio stops.
+     * surface; emits null when video is mirroring (the video screen takes over) or the AirPlay
+     * route ends. A paused audio stream keeps its last metadata visible while the route remains
+     * connected.
      */
     private val onNowPlayingChanged: (NowPlayingInfo?) -> Unit = {},
     /** Pairing PIN to show ([pin]) or hide (null) on the TV during SRP pair-setup. */
@@ -100,6 +108,11 @@ class AirPlayReceiver(
     // SupervisorJob: child coroutine failures don't propagate to siblings.
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + job)
+    private val legacyStartupLock = Any()
+    @Volatile private var legacyStartupGeneration = 0L
+    private var legacyStartupJob: Job? = null
+    private val mediaSession = MediaSessionGate()
+    private val stateEmissionSequence = AtomicLong(0L)
 
     // Child components
     private var mdnsService: MdnsService? = null
@@ -114,6 +127,7 @@ class AirPlayReceiver(
 
     // AirPlay 2 mirroring: data stream server + event channel + keys (set during SETUP).
     @Volatile private var mirrorServer: MirrorStreamServer? = null
+    private val audioServerLock = Any()
     @Volatile private var audioServer: AudioStreamServer? = null
     @Volatile private var bufferedAudioServer: BufferedAudioServer? = null
     @Volatile private var urlVideoPlayer: AirPlayVideoPlayer? = null
@@ -128,9 +142,12 @@ class AirPlayReceiver(
     @Volatile private var mirrorAesIv: ByteArray? = null
 
     // ─── Now-playing (audio-only) state ──────────────────────────────────────
-    // The now-playing card shows only when audio plays WITHOUT video. We track both stream kinds
-    // plus the latest DMAP metadata/artwork and recompute on every change (see [emitNowPlaying]).
+    // The now-playing card shows while an audio route is connected WITHOUT video, including while
+    // playback is paused. A stream may be torn down and recreated inside one live AirPlay route, so
+    // route presence is tracked separately from whether audio packets are currently flowing.
+    // Latest DMAP metadata/artwork is recomputed on every change (see [emitNowPlaying]).
     @Volatile private var audioPlaying = false
+    @Volatile private var audioRouteActive = false
     @Volatile private var videoPlaying = false
     @Volatile private var npSenderName = "AirPlay"
     @Volatile private var npTitle: String? = null
@@ -171,6 +188,8 @@ class AirPlayReceiver(
      */
     fun stop() {
         Logger.i("AirPlayReceiver stopping")
+        mediaSession.reset()
+        invalidateLegacyStartup()
         try {
             rtspHandler?.stop()
             timingHandler?.stop()
@@ -204,7 +223,16 @@ class AirPlayReceiver(
     private fun startMdnsService() {
         mdnsService = MdnsService(
             context = context,
-            onStateChange = { state -> emitState(state) },
+            onStateChange = { state ->
+                // Discovery recovery runs independently of media. Never let a stale advertising
+                // or transient NSD error edge dismiss active playback or release its audio focus.
+                mediaSession.recordDiscoveryState(state)
+                if (mediaSession.shouldPublishDiscovery(state)) {
+                    emitState(state, isStillRelevant = { mediaSession.shouldPublishDiscovery(state) })
+                } else {
+                    Logger.d("Deferring mDNS $state state until active playback ends")
+                }
+            },
             onActualNameRegistered = { actualName -> onActualNameRegistered(actualName) }
         ).also { it.start(displayName.ifBlank { null }) }
         Logger.d("mDNS service started")
@@ -217,19 +245,38 @@ class AirPlayReceiver(
             displayHeight = mirrorHeight,
             audioEnabled = audioEnabled,
             videoSurfaceProvider = videoSurfaceProvider,
-            onStreamingStarted = { session -> onStreamingStarted(session) },
+            onStreamingStarted = { session ->
+                mediaSession.activate()
+                onStreamingStarted(session)
+            },
             onStreamingStopped = { onStreamingStopped() },
-            onPhotoReceived = { bytes, imageType -> onPhotoReceived(bytes, imageType) },
+            onPhotoReceived = { bytes, imageType ->
+                mediaSession.activate()
+                onPhotoReceived(bytes, imageType)
+            },
             onPhotoCleared = { onPhotoCleared() },
             onMirrorSetupKeys = { aesKey, ecdhSecret, aesIv, remoteAddr, senderTimingPort ->
+                mediaSession.activate()
                 startMirrorKeys(aesKey, ecdhSecret, aesIv, remoteAddr, senderTimingPort)
             },
-            onMirrorStreamStart = { streamConnectionId -> startMirrorStream(streamConnectionId) },
-            onMirrorAudioStart = { sampleRate, channels, ct, spf -> startMirrorAudio(sampleRate, channels, ct, spf) },
+            onMirrorStreamStart = { streamConnectionId ->
+                mediaSession.activate()
+                startMirrorStream(streamConnectionId)
+            },
+            onMirrorAudioStart = { setup ->
+                mediaSession.activate()
+                startMirrorAudio(setup)
+            },
             onMirrorAudioStop = { stopMirrorAudio() },
             onMirrorVideoStop = { stopMirrorVideo() },
-            onBufferedAudioStart = { startBufferedAudio() },
+            onBufferedAudioStart = {
+                mediaSession.activate()
+                startBufferedAudio()
+            },
             onBufferedAudioStop = { stopBufferedAudio() },
+            onAudioFlush = { boundary -> flushAudio(boundary) },
+            onAudioPause = { pauseAudio() },
+            onAudioResume = { boundary -> resumeAudio(boundary) },
             onVolume = { v -> updateAudioVolume(v) },
             onNowPlayingMetadata = { title, artist, album ->
                 npTitle = title; npArtist = artist; npAlbum = album
@@ -239,7 +286,10 @@ class AirPlayReceiver(
                 npArtwork = bytes.takeIf { it.isNotEmpty() }
                 emitNowPlaying()
             },
-            onVideoPlay = { url, start -> startUrlVideo(url, start) },
+            onVideoPlay = { url, start ->
+                mediaSession.activate()
+                startUrlVideo(url, start)
+            },
             onVideoRate = { rate -> urlVideoPlayer?.setRate(rate) },
             onVideoScrub = { pos -> urlVideoPlayer?.scrub(pos) },
             onVideoStop = { stopUrlVideo() },
@@ -247,7 +297,8 @@ class AirPlayReceiver(
             onRemoteControlInfo = { dacpId, activeRemote -> dacpClient.configure(dacpId, activeRemote) },
             pinAuthEnabled = pinAuthEnabled,
             pairingStore = pairingStore,
-            onShowPin = { pin -> onPinChanged(pin) }
+            onShowPin = { pin -> onPinChanged(pin) },
+            hasRecentMediaActivity = { StreamStats.hasRecentMediaPacket(5_000L) }
         ).also { it.start(scope) }
         Logger.i("RTSP handler started on port 7000 (audioEnabled=$audioEnabled pinAuth=$pinAuthEnabled)")
     }
@@ -266,25 +317,58 @@ class AirPlayReceiver(
         Logger.i("Streaming started — video=${session.hasVideo} audio=${session.hasAudio} " +
                  "audioOnly=${session.isAudioOnly}")
 
-        scope.launch {
+        val generation = synchronized(legacyStartupLock) {
+            legacyStartupJob?.cancel()
+            ++legacyStartupGeneration
+        }
+        val startup = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                if (session.hasVideo) startVideoDecoder(session)
-                if (session.hasAudio) startAudioPlayer(session)
-                // Legacy (SDP) session: reflect its stream kinds into now-playing state so an
-                // audio-only RAOP session shows the now-playing card.
-                npSenderName = session.senderName.ifBlank { npSenderName }
-                videoPlaying = session.hasVideo
-                audioPlaying = session.hasAudio
-                emitNowPlaying()
-                // Notify MirrorService of the sender name BEFORE emitting CONNECTED,
-                // so the name is ready when the ActiveConnection is created.
-                onSenderNameChanged(session.senderName)
-                emitState(ProtocolState.CONNECTED)
+                // Take over first: a background receiver has no Activity/Surface until CONNECTED.
+                // Awaiting this dispatch (rather than scheduling another child) preserves order.
+                withContext(Dispatchers.Main) {
+                    if (generation != legacyStartupGeneration) return@withContext
+                    npSenderName = session.senderName.ifBlank { npSenderName }
+                    videoPlaying = session.hasVideo
+                    audioPlaying = session.hasAudio
+                    audioRouteActive = session.hasAudio
+                    emitNowPlaying()
+                    onSenderNameChanged(session.senderName)
+                    if (generation == legacyStartupGeneration) emitState(ProtocolState.CONNECTED)
+                }
+                synchronized(legacyStartupLock) {
+                    if (generation != legacyStartupGeneration) return@launch
+                    // Audio-only playback never waits for a video output.
+                    if (session.hasAudio) startAudioPlayer(session)
+                }
+                if (session.hasVideo) {
+                    val surface = awaitValidOutput(
+                        provider = videoSurfaceProvider,
+                        valid = { it.isValid },
+                        current = { generation == legacyStartupGeneration }
+                    )
+                    synchronized(legacyStartupLock) {
+                        if (generation != legacyStartupGeneration) return@launch
+                        if (surface != null) startVideoDecoder(session, surface)
+                        else Logger.w("Legacy video: no valid surface after 5 seconds; audio/control remain available")
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Logger.e("Failed to start media pipeline", e)
-                emitState(ProtocolState.ERROR)
+                if (generation == legacyStartupGeneration) emitState(ProtocolState.ERROR)
             }
         }
+        synchronized(legacyStartupLock) {
+            if (generation == legacyStartupGeneration) legacyStartupJob = startup else startup.cancel()
+        }
+        startup.start()
+    }
+
+    private fun invalidateLegacyStartup() = synchronized(legacyStartupLock) {
+        legacyStartupGeneration++
+        legacyStartupJob?.cancel()
+        legacyStartupJob = null
     }
 
     /**
@@ -294,16 +378,17 @@ class AirPlayReceiver(
      * in sender pickers immediately.
      */
     private fun onStreamingStopped() {
+        val discoveryState = mediaSession.endOnce()
+        if (!discoveryState.ended) {
+            Logger.d("Ignoring duplicate or discovery-only AirPlay disconnect")
+            return
+        }
         Logger.i("Streaming stopped — releasing media components")
         releaseMediaComponents()
-        emitState(ProtocolState.ADVERTISING)
-
-        scope.launch {
-            try {
-                mdnsService?.restart(displayName.ifBlank { null })
-            } catch (e: Exception) {
-                Logger.e("Failed to restart mDNS after streaming", e)
-            }
+        // If discovery failed while media was active, expose that real state instead of falsely
+        // claiming the TV is ready. A later successful re-registration publishes ADVERTISING.
+        discoveryState.state?.let { state ->
+            emitState(state, isStillRelevant = { mediaSession.shouldPublishTeardown(state) })
         }
     }
 
@@ -319,11 +404,8 @@ class AirPlayReceiver(
      * [RtspHandler.onVideoNalUnit] is wired here so RTP interleaved NAL units
      * flow directly into [VideoDecoder.decodeNalUnit].
      */
-    private fun startVideoDecoder(session: SessionDescription) {
-        val surface = videoSurfaceProvider() ?: run {
-            Logger.w("VideoDecoder: no surface available — skipping video pipeline")
-            return
-        }
+    private fun startVideoDecoder(session: SessionDescription, surface: Surface) {
+        if (!surface.isValid) return
         val sps = session.spsBytes ?: run {
             Logger.w("VideoDecoder: no SPS in SDP — skipping")
             return
@@ -333,6 +415,7 @@ class AirPlayReceiver(
             return
         }
 
+        videoDecoder?.release()
         videoDecoder = VideoDecoder(surface).also { decoder ->
             decoder.initialize(sps, pps, DEFAULT_VIDEO_WIDTH, DEFAULT_VIDEO_HEIGHT)
             rtspHandler?.onVideoNalUnit = { nalUnit, ptsUs ->
@@ -383,6 +466,21 @@ class AirPlayReceiver(
         audioServer?.setVolume(volume)
     }
 
+    /** Discards queued audio while retaining pairing/FairPlay state for pause, seek, and resume. */
+    private fun flushAudio(boundary: AudioFlushBoundary?) {
+        audioPlayer?.flush()
+        audioServer?.flush(boundary?.sequence, boundary?.timestamp)
+    }
+
+    private fun pauseAudio() {
+        audioPlayer?.flush()
+        audioServer?.pause()
+    }
+
+    private fun resumeAudio(boundary: AudioFlushBoundary?) {
+        audioServer?.resume(boundary?.sequence, boundary?.timestamp)
+    }
+
     /**
      * Opens a UDP socket on [AUDIO_RTP_PORT] and feeds every received packet to
      * [AudioPlayer.playAudioPacket].
@@ -406,6 +504,7 @@ class AirPlayReceiver(
 
                 while (isActive && audioSocket === socket && !socket.isClosed) {
                     receiveAudioDatagram(socket, packet)
+                    StreamStats.markMediaPacket()
                     // copyOf trims to actual packet length before passing to the player
                     player.playAudioPacket(packet.data.copyOf(packet.length))
                 }
@@ -481,26 +580,88 @@ class AirPlayReceiver(
     }
 
     /** Mirror SETUP audio stream (type 96): start the AAC-ELD / AAC-LC / ALAC audio server. @return (dataPort, controlPort). */
-    private fun startMirrorAudio(sampleRate: Int, channels: Int, codecType: Int, framesPerPacket: Int): Pair<Int, Int> {
+    private fun startMirrorAudio(setup: RealtimeAudioSetup): Pair<Int, Int> {
         val aesKey = mirrorAesKey ?: run { Logger.e("audio start before keys set"); return 0 to 0 }
         val ecdhSecret = mirrorEcdhSecret ?: return 0 to 0
         val aesIv = mirrorAesIv ?: return 0 to 0
-        val server = AudioStreamServer(aesKey, ecdhSecret, aesIv, sampleRate, channels, codecType, framesPerPacket)
-            .also { audioServer = it; it.setVolume(senderVolumeDb); it.start(scope) }
-        audioPlaying = true
+        lateinit var server: AudioStreamServer
+        server = AudioStreamServer(
+            aesKey = aesKey,
+            ecdhSecret = ecdhSecret,
+            aesIv = aesIv,
+            sampleRate = setup.sampleRate,
+            channels = setup.channels,
+            codecType = setup.codecType,
+            framesPerPacket = setup.framesPerPacket,
+            remoteAddress = setup.remoteAddress,
+            senderControlPort = setup.senderControlPort,
+            latencyMinSamples = setup.latencyMinSamples,
+            latencyMaxSamples = setup.latencyMaxSamples,
+            onFatalError = failure@ { error ->
+                synchronized(audioServerLock) {
+                    if (audioServer !== server) {
+                        Logger.d("Ignoring failure from a superseded realtime audio server")
+                        return@synchronized
+                    }
+                    audioServer = null
+                    Logger.e("Realtime audio sink failed; requesting a clean sender reconnect", error)
+                    val aborted = rtspHandler?.abortActiveSession(
+                        "realtime audio sink failed",
+                        setup.sessionGeneration.takeIf { it != 0L }
+                    ) == true
+                    // Keep teardown inside the ownership lock: a concurrent SETUP cannot install a
+                    // new sink between our identity check and cleanup. A generation mismatch means
+                    // a newer control socket already owns the receiver and must not be disturbed.
+                    if (aborted) onStreamingStopped()
+                }
+            }
+        )
+        synchronized(audioServerLock) {
+            if (setup.sessionGeneration != 0L &&
+                rtspHandler?.isActiveSession(setup.sessionGeneration) != true) {
+                server.stop()
+                throw IllegalStateException("audio SETUP belongs to a stale control session")
+            }
+            val previousServer = audioServer
+            audioServer = server
+            // Commit route state before launching workers. An immediate AudioTrack failure can now
+            // tear it down, and this method has no later assignment that can resurrect ghost state.
+            audioPlaying = true
+            audioRouteActive = true
+            try {
+                // The old playback owner releases its AudioTrack before the replacement launches,
+                // preventing overlapping tracks, static, and vendor audio-resource contention.
+                if (previousServer != null && !previousServer.stop()) {
+                    throw IllegalStateException("previous realtime audio track did not stop cleanly")
+                }
+                server.setVolume(senderVolumeDb)
+                server.start(scope)
+            } catch (e: Exception) {
+                if (audioServer === server) {
+                    audioServer = null
+                    audioPlaying = false
+                    audioRouteActive = false
+                }
+                server.stop()
+                throw e
+            }
+        }
         emitNowPlaying()
         Logger.i("Mirror audio server started: dataPort=${server.dataPort} controlPort=${server.controlPort}")
         return server.dataPort to server.controlPort
     }
 
-    /** Stops ONLY the mirror audio stream (macOS dynamic-stream TEARDOWN) — video keeps running. */
+    /** Stops only mirror audio while retaining same-session metadata for an immediate resume. */
     private fun stopMirrorAudio() {
-        audioServer?.stop()
-        audioServer = null
-        audioPlaying = false
-        clearNowPlayingMetadata()
+        val server = synchronized(audioServerLock) {
+            audioServer.also {
+                audioServer = null
+                audioPlaying = false
+            }
+        }
+        server?.stop()
         emitNowPlaying()
-        Logger.i("Mirror audio stream stopped (video mirroring continues)")
+        Logger.i("Mirror audio stream stopped; session metadata retained for resume")
     }
 
     /** Stops ONLY the mirror video stream (macOS dynamic-stream TEARDOWN) — audio keeps playing. */
@@ -517,6 +678,7 @@ class AirPlayReceiver(
      * [AirPlayVideoPlayer], which fetches + plays it via MediaPlayer onto the same Surface.
      */
     private fun startUrlVideo(url: String, startFraction: Double) {
+        invalidateLegacyStartup()
         onSenderNameChanged("AirPlay")
         emitState(ProtocolState.CONNECTED)   // shows StreamingScreen → Surface becomes available
         val player = urlVideoPlayer ?: AirPlayVideoPlayer(
@@ -540,30 +702,33 @@ class AirPlayReceiver(
         bufferedAudioServer?.stop()
         val server = BufferedAudioServer().also { bufferedAudioServer = it; it.start(scope) }
         audioPlaying = true   // buffered audio (type 103) is always audio-only
+        audioRouteActive = true
         emitNowPlaying()
         Logger.i("Buffered audio server started: dataPort=${server.dataPort}")
         return server.dataPort
     }
 
-    /** Stops the buffered audio-only stream (type 103 TEARDOWN). */
+    /** Stops the buffered audio stream while retaining same-route metadata for resume. */
     private fun stopBufferedAudio() {
         bufferedAudioServer?.stop()
         bufferedAudioServer = null
         audioPlaying = false
-        clearNowPlayingMetadata()
         emitNowPlaying()
-        Logger.i("Buffered audio stream stopped")
+        Logger.i("Buffered audio stream stopped; session metadata retained for resume")
     }
 
     /** Clears the video NAL callback, closes the audio socket, and releases media components. */
     private fun releaseMediaComponents() {
+        invalidateLegacyStartup()
         rtspHandler?.onVideoNalUnit = null
         try { audioSocket?.close() } catch (e: Exception) { /* non-fatal */ }
         audioSocket = null
         mirrorServer?.stop()
         mirrorServer = null
-        audioServer?.stop()
-        audioServer = null
+        val realtimeAudioServer = synchronized(audioServerLock) {
+            audioServer.also { audioServer = null }
+        }
+        realtimeAudioServer?.stop()
         bufferedAudioServer?.stop()
         bufferedAudioServer = null
         urlVideoPlayer?.release()
@@ -575,7 +740,7 @@ class AirPlayReceiver(
         try { eventSocket?.close() } catch (e: Exception) { /* non-fatal */ }
         eventSocket = null
         // Clear the FairPlay/ECDH keys on FULL teardown only. This method runs on a genuine session
-        // end (last-stream / session TEARDOWN, or control-connection close) — NOT on a per-stream
+        // end (session-level TEARDOWN or control-connection close) — NOT on a per-stream
         // teardown, which goes through stopMirrorAudio/stopMirrorVideo and leaves the keys intact so
         // macOS can re-add a dynamic stream on the same live session without re-sending keys (that
         // dynamic-readd path is why the keys must survive a stream stop). Clearing here prevents a
@@ -587,16 +752,21 @@ class AirPlayReceiver(
         videoDecoder = null
         audioPlayer?.release()
         audioPlayer = null
+        StreamStats.resetStreams()
+        // A photo session has no decoder/server to clear its UI state. Always clear the frame on
+        // full teardown so the temporary TV takeover and audio focus can return to the prior app.
+        onPhotoCleared()
         // Session fully torn down — clear now-playing so the UI leaves the audio card.
         audioPlaying = false
+        audioRouteActive = false
         videoPlaying = false
         clearNowPlayingMetadata()
         emitNowPlaying()
     }
 
-    /** Pushes the current now-playing state out: a [NowPlayingInfo] when audio plays without video, else null. */
+    /** Pushes now-playing while an audio route is connected without video, including when paused. */
     private fun emitNowPlaying() {
-        val show = audioPlaying && !videoPlaying
+        val show = audioRouteActive && !videoPlaying
         onNowPlayingChanged(
             if (show) NowPlayingInfo(npSenderName, npTitle, npArtist, npAlbum, npArtwork) else null
         )
@@ -610,11 +780,21 @@ class AirPlayReceiver(
     // ─── Private: state emission ─────────────────────────────────────────────
 
     /** Dispatches [state] on the Main thread (Android UI rule). */
-    private fun emitState(state: ProtocolState) {
-        scope.launch {
-            withContext(Dispatchers.Main) {
-                onStateChanged(state)
+    private fun emitState(
+        state: ProtocolState,
+        isStillRelevant: () -> Boolean = { true }
+    ) {
+        val sequence = stateEmissionSequence.incrementAndGet()
+        scope.launch(Dispatchers.Main) {
+            // State callbacks originate on multiple network threads. Only the newest transition
+            // may reach the UI, and discovery is re-checked at delivery time so a queued stale
+            // ADVERTISING callback can never overwrite a newer CONNECTED state.
+            if (sequence != stateEmissionSequence.get()) return@launch
+            if (!isStillRelevant()) {
+                Logger.d("Ignoring stale $state state during active playback")
+                return@launch
             }
+            onStateChanged(state)
         }
     }
 
@@ -643,4 +823,65 @@ class AirPlayReceiver(
 internal fun receiveAudioDatagram(socket: DatagramSocket, packet: DatagramPacket) {
     packet.length = packet.data.size - packet.offset
     socket.receive(packet)
+}
+
+/** A bounded, cancellable wait shared by legacy and URL video startup; no RTSP/main-thread sleeps. */
+internal suspend fun <T : Any> awaitValidOutput(
+    provider: () -> T?,
+    valid: (T) -> Boolean,
+    current: () -> Boolean,
+    timeoutMs: Long = 5_000,
+    pollMs: Long = 50
+): T? = withTimeoutOrNull(timeoutMs) {
+    require(pollMs > 0)
+    while (current()) {
+        provider()?.takeIf(valid)?.let { return@withTimeoutOrNull it }
+        delay(pollMs)
+    }
+    null
+}
+
+/** Serializes the visible media lifecycle across duplicated RTSP and asynchronous NSD callbacks. */
+internal data class MediaSessionEnd(val ended: Boolean, val state: ProtocolState?)
+
+internal class MediaSessionGate {
+    private var active = false
+    private var latestDiscoveryState: ProtocolState = ProtocolState.ERROR
+
+    @Synchronized fun activate() { active = true }
+    @Synchronized fun reset() { active = false; latestDiscoveryState = ProtocolState.ERROR }
+
+    @Synchronized
+    fun recordDiscoveryState(state: ProtocolState) {
+        if (state in DISCOVERY_STATES) latestDiscoveryState = state
+    }
+
+    @Synchronized
+    fun shouldPublishDiscovery(state: ProtocolState): Boolean =
+        !active || state !in DISCOVERY_STATES
+
+    @Synchronized
+    fun shouldPublishTeardown(state: ProtocolState): Boolean =
+        !active && latestDiscoveryState == state
+
+    @Synchronized
+    fun filterDiscoveryState(state: ProtocolState): ProtocolState? {
+        recordDiscoveryState(state)
+        return state.takeIf { shouldPublishDiscovery(it) }
+    }
+
+    @Synchronized
+    fun endOnce(): MediaSessionEnd {
+        if (!active) return MediaSessionEnd(false, null)
+        active = false
+        return MediaSessionEnd(true, latestDiscoveryState)
+    }
+
+    private companion object {
+        val DISCOVERY_STATES = setOf(
+            ProtocolState.ADVERTISING,
+            ProtocolState.ERROR,
+            ProtocolState.DISABLED
+        )
+    }
 }
