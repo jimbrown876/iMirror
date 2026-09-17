@@ -46,10 +46,11 @@ data class AppSettings(
 
     // ─── Service behavior ──────────────────────────────────────────────────
     /**
-     * Whether MirrorService starts automatically on device boot.
+     * Whether MirrorService starts automatically on device boot and app updates.
      * Requires the RECEIVE_BOOT_COMPLETED permission to be effective.
+     * Enabled for Jim's always-ready receiver; the Settings toggle can disable it.
      */
-    val startOnBoot: Boolean = false,
+    val startOnBoot: Boolean = true,
 
     // ─── Developer / Debug ─────────────────────────────────────────────────
     /**

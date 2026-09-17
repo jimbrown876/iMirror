@@ -68,8 +68,64 @@ class AudioVolumeAndReceiveTest {
         assertEquals(1408, packet.length)
     }
 
+    @Test
+    fun `full session teardown clears a photo takeover`() {
+        val context = mockk<Context>(relaxed = true)
+        every { context.getSystemService(Context.NSD_SERVICE) } returns mockk<NsdManager>(relaxed = true)
+        var clears = 0
+        val receiver = AirPlayReceiver(
+            context,
+            videoSurfaceProvider = { null },
+            onStateChanged = {},
+            onPhotoCleared = { clears++ }
+        )
+        AirPlayReceiver::class.java.getDeclaredMethod("releaseMediaComponents")
+            .apply { isAccessible = true }
+            .invoke(receiver)
+        assertEquals(1, clears)
+    }
+
+    @Test
+    fun `stream audio stop retains artwork and metadata until full session teardown`() {
+        val context = mockk<Context>(relaxed = true)
+        every { context.getSystemService(Context.NSD_SERVICE) } returns mockk<NsdManager>(relaxed = true)
+        val emissions = mutableListOf<NowPlayingInfo?>()
+        val receiver = AirPlayReceiver(
+            context,
+            videoSurfaceProvider = { null },
+            onStateChanged = {},
+            onNowPlayingChanged = { emissions.add(it) }
+        )
+        val artwork = byteArrayOf(1, 2, 3, 4)
+        setField(receiver, "npTitle", "Song")
+        setField(receiver, "npArtist", "Artist")
+        setField(receiver, "npAlbum", "Album")
+        setField(receiver, "npArtwork", artwork)
+        setField(receiver, "audioPlaying", true)
+        setField(receiver, "audioRouteActive", true)
+
+        invokeNoArgs(receiver, "stopMirrorAudio")
+        assertEquals("Song", field(receiver, "npTitle"))
+        assertEquals("Artist", field(receiver, "npArtist"))
+        assertEquals("Album", field(receiver, "npAlbum"))
+        assertArrayEquals(artwork, field(receiver, "npArtwork") as ByteArray)
+        assertEquals("Song", emissions.last()?.title)
+        assertEquals("Artist", emissions.last()?.artist)
+        assertEquals("Album", emissions.last()?.album)
+        assertArrayEquals(artwork, emissions.last()?.artwork)
+
+        invokeNoArgs(receiver, "releaseMediaComponents")
+        assertNull(field(receiver, "npTitle"))
+        assertNull(field(receiver, "npArtist"))
+        assertNull(field(receiver, "npAlbum"))
+        assertNull(field(receiver, "npArtwork"))
+        assertNull(emissions.last())
+    }
+
     private fun field(target: Any, name: String): Any? = target.javaClass.getDeclaredField(name)
         .apply { isAccessible = true }.get(target)
     private fun setField(target: Any, name: String, value: Any) = target.javaClass.getDeclaredField(name)
         .apply { isAccessible = true }.set(target, value)
+    private fun invokeNoArgs(target: Any, name: String) = target.javaClass.getDeclaredMethod(name)
+        .apply { isAccessible = true }.invoke(target)
 }

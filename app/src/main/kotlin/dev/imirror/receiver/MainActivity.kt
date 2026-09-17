@@ -16,6 +16,7 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.Lifecycle
 import dev.imirror.receiver.service.MirrorService
 import dev.imirror.receiver.service.PhotoFrame
 import dev.imirror.receiver.service.ProtocolState
@@ -27,7 +28,10 @@ import dev.imirror.receiver.ui.PhotoScreen
 import dev.imirror.receiver.ui.PinScreen
 import dev.imirror.receiver.ui.SettingsFragment
 import dev.imirror.receiver.ui.StreamingScreen
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import timber.log.Timber
 
@@ -66,25 +70,32 @@ class MainActivity : AppCompatActivity() {
     // Service binding — gives access to state flows for showing/hiding the streaming overlay
     private var service: MirrorService? = null
     private var isBound = false
+    private var bindRequested = false
     private var currentAirPlayState = ProtocolState.DISABLED
     private var currentPhotoFrame: PhotoFrame? = null
     private var currentNowPlaying: NowPlayingInfo? = null
     private var currentPin: String? = null
+    private var overlayJob: Job? = null
+    private var returnAfterPlayback = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            if (!bindRequested || !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
             service = (binder as? MirrorService.LocalBinder)?.getService()
             isBound = true
             Timber.d("MainActivity: bound to MirrorService")
 
             // Wire the streaming Surface so the service can pass it to VideoDecoder
             service?.setVideoSurfaceProvider { getVideoSurface() }
+            service?.setPresentationVisible(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
 
             // Show/hide the full-screen overlay for video streams and photos.
             observeOverlayState()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
+            overlayJob?.cancel()
+            overlayJob = null
             service = null
             isBound = false
             Timber.d("MainActivity: unbound from MirrorService")
@@ -96,6 +107,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        returnAfterPlayback = savedInstanceState?.getBoolean(EXTRA_RETURN_AFTER_PLAYBACK)
+            ?: intent.getBooleanExtra(EXTRA_RETURN_AFTER_PLAYBACK, false)
+        if (Build.VERSION.SDK_INT >= 27 && returnAfterPlayback) setTurnScreenOn(true)
         setContentView(R.layout.activity_main)
 
         Timber.d("MainActivity created")
@@ -119,32 +133,45 @@ class MainActivity : AppCompatActivity() {
         super.onStart()
         // Bind so we can observe StateFlows and supply the video Surface
         val intent = Intent(this, MirrorService::class.java)
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        bindRequested = bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        service?.setPresentationVisible(true)
+    }
+
+    override fun onPause() {
+        service?.setPresentationVisible(false)
+        super.onPause()
     }
 
     override fun onStop() {
         super.onStop()
+        overlayJob?.cancel()
+        overlayJob = null
+        service?.setPresentationVisible(false)
         // Clear surface reference before unbinding to avoid holding a dead Surface
         service?.setVideoSurfaceProvider { null }
-        if (isBound) {
+        if (bindRequested) {
             unbindService(serviceConnection)
-            isBound = false
+            bindRequested = false
         }
+        isBound = false
+        service = null
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        // A user-initiated exit (Back out of the app) should end any active mirror — closing the
-        // service stops the receiver, which drops the RTSP connection so the sender stops mirroring
-        // too. isFinishing distinguishes a real exit from a config-change recreation (where the
-        // service must keep running). Backgrounding via Home goes through onStop only (no destroy),
-        // so the receiver keeps advertising for a quick return.
-        if (isFinishing) {
-            Timber.d("MainActivity finishing — stopping service so mirroring doesn't linger")
-            ServiceController.stop(this)
-        } else {
-            Timber.d("MainActivity destroyed (recreation) — leaving service running")
-        }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        returnAfterPlayback = intent.getBooleanExtra(EXTRA_RETURN_AFTER_PLAYBACK, false)
+        if (Build.VERSION.SDK_INT >= 27) setTurnScreenOn(returnAfterPlayback)
+        observeOverlayState()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(EXTRA_RETURN_AFTER_PLAYBACK, returnAfterPlayback)
+        super.onSaveInstanceState(outState)
     }
 
     // ─── View Setup ──────────────────────────────────────────────────────────
@@ -332,6 +359,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val PERMISSION_REQUEST_NOTIFICATIONS = 1001
+        const val EXTRA_RETURN_AFTER_PLAYBACK = "dev.imirror.receiver.RETURN_AFTER_PLAYBACK"
     }
 
     // ─── Streaming overlay ────────────────────────────────────────────────────
@@ -340,33 +368,32 @@ class MainActivity : AppCompatActivity() {
      * Observes [MirrorService.airPlayState] and [MirrorService.photoFrame]
      * and shows the appropriate full-screen overlay.
      *
-     * Called once after the service is bound. The coroutine is automatically cancelled
-     * by [lifecycleScope] when the Activity stops.
+     * One combined collector is explicitly cancelled onStop, so rebinding cannot leave
+     * duplicate collectors or an old Activity dismissing a newer playback window.
      */
     private fun observeOverlayState() {
         val svc = service ?: return
-        lifecycleScope.launch {
-            svc.airPlayState.collectLatest { state ->
+        overlayJob?.cancel()
+        overlayJob = lifecycleScope.launch {
+            combine(svc.airPlayState, svc.photoFrame, svc.nowPlaying, svc.pairingPin,
+                svc.presentationActive) { state, frame, info, pin, active ->
                 currentAirPlayState = state
-                updateOverlay()
-            }
-        }
-        lifecycleScope.launch {
-            svc.photoFrame.collectLatest { frame ->
                 currentPhotoFrame = frame
-                updateOverlay()
-            }
-        }
-        lifecycleScope.launch {
-            svc.nowPlaying.collectLatest { info ->
                 currentNowPlaying = info
-                updateOverlay()
-            }
-        }
-        lifecycleScope.launch {
-            svc.pairingPin.collectLatest { pin ->
                 currentPin = pin
+                active
+            }.collectLatest { active ->
                 updateOverlay()
+                window.decorView.keepScreenOn = active
+                if (returnAfterPlayback && !active) {
+                    // Pairing-to-playback and teardown callbacks may arrive separately.
+                    // A new active state cancels this short return grace period.
+                    delay(500)
+                    if (!svc.presentationActive.value && !isFinishing) {
+                        Timber.i("AirPlay ended — returning to previous TV task")
+                        finishAndRemoveTask()
+                    }
+                }
             }
         }
     }

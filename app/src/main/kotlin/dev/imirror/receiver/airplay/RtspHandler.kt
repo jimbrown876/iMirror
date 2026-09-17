@@ -7,12 +7,15 @@ import dev.imirror.receiver.airplay.handshake.PairingSession
 import dev.imirror.receiver.airplay.handshake.PlistCodec
 import dev.imirror.receiver.util.Logger
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 
 /**
  * RtspHandler — Manages the RTSP session with the AirPlay sender (macOS).
@@ -51,6 +54,8 @@ open class RtspHandler(
     private val onBufferedAudioStart: () -> Int = { 0 },
     /** Stops the buffered audio-only stream (type 103 TEARDOWN). */
     private val onBufferedAudioStop: () -> Unit = {},
+    /** Discards queued audio for FLUSH/PAUSE without ending the authenticated AirPlay session. */
+    private val onAudioFlush: () -> Unit = {},
     /** Sender volume change (AirPlay dB: −30…0, or ≤ −144 = mute) via SET_PARAMETER. */
     private val onVolume: (Float) -> Unit = {},
     /** Now-playing track metadata (DMAP) from SET_PARAMETER — any field may be null. */
@@ -74,7 +79,9 @@ open class RtspHandler(
     /** Persistent store of paired controllers' Ed25519 keys (for pair-verify). */
     private val pairingStore: dev.imirror.receiver.airplay.handshake.PairingStore? = null,
     /** Shows ([pin]) or hides (null) the on-screen pairing PIN during SRP pair-setup. */
-    private val onShowPin: (pin: String?) -> Unit = {}
+    private val onShowPin: (pin: String?) -> Unit = {},
+    /** Real media liveness; RTSP control can be quiet for minutes while audio/video still flows. */
+    private val hasRecentMediaActivity: () -> Boolean = { false }
 ) {
 
     // ─── Legacy AirPlay SRP PIN pairing (only used when pinAuthEnabled) ───────
@@ -92,6 +99,10 @@ open class RtspHandler(
 
     @Volatile
     private var activeClient: Socket? = null
+    private val clientLock = Any()
+    @Volatile private var activeClientJob: Job? = null
+    @Volatile private var activeClientEstablished = false
+    @Volatile private var activeClientLastRequestNanos = 0L
 
     @Volatile
     private var running = false
@@ -147,14 +158,24 @@ open class RtspHandler(
     /** Stops the RTSP server. */
     fun stop() {
         running = false
+        val client: Socket?
+        val server: ServerSocket?
+        synchronized(clientLock) {
+            client = activeClient
+            server = serverSocket
+            activeClient = null
+            activeClientJob?.cancel()
+            activeClientJob = null
+            activeClientEstablished = false
+            activeClientLastRequestNanos = 0L
+            serverSocket = null
+        }
         try {
-            activeClient?.close()
-            serverSocket?.close()
+            client?.close()
+            server?.close()
         } catch (e: Exception) {
             Logger.e("Error closing RTSP sockets (non-fatal)", e)
         }
-        activeClient = null
-        serverSocket = null
         clearPendingPin()
         Logger.i("RTSP handler stopped")
     }
@@ -184,24 +205,57 @@ open class RtspHandler(
         throw lastError ?: java.io.IOException("RTSP bind to $RTSP_PORT failed")
     }
 
-    private fun runServer(scope: CoroutineScope) {
+    private suspend fun runServer(scope: CoroutineScope) {
         try {
             serverSocket = bindRtspSocket()
             Logger.i("RTSP server listening on port $RTSP_PORT")
 
             while (running && scope.isActive) {
                 val clientSocket = serverSocket!!.accept()
+                clientSocket.keepAlive = true
+                clientSocket.tcpNoDelay = true
                 Logger.i("New client connected: ${clientSocket.inetAddress.hostAddress}")
 
-                if (activeClient != null && !activeClient!!.isClosed) {
-                    Logger.w("Rejecting second client — already streaming")
-                    sendServiceUnavailable(clientSocket)
-                    clientSocket.close()
-                    continue
+                val (existing, existingJob, decision) = synchronized(clientLock) {
+                    val current = activeClient?.takeUnless { it.isClosed }
+                    val idleMs = if (activeClientLastRequestNanos == 0L) Long.MAX_VALUE else
+                        (System.nanoTime() - activeClientLastRequestNanos).coerceAtLeast(0L) / 1_000_000L
+                    Triple(current, activeClientJob, decideIncomingClient(
+                        hasActiveClient = current != null,
+                        activeSessionEstablished = activeClientEstablished,
+                        controlIdleMillis = idleMs,
+                        mediaRecentlyActive = hasRecentMediaActivity()
+                    ))
                 }
 
-                activeClient = clientSocket
-                handleClient(clientSocket)
+                when (decision) {
+                    IncomingClientDecision.REJECT_BUSY -> {
+                        Logger.w("Rejecting second client — active sender is still healthy")
+                        sendServiceUnavailable(clientSocket)
+                        clientSocket.close()
+                        continue
+                    }
+                    IncomingClientDecision.REPLACE_STALE -> {
+                        Logger.i("Replacing abandoned or incomplete AirPlay control connection")
+                        runCatching { existing?.close() }
+                        existingJob?.join()
+                    }
+                    IncomingClientDecision.ACCEPT -> Unit
+                }
+                if (!running || !scope.isActive) {
+                    clientSocket.close()
+                    break
+                }
+                val job = scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                    handleClient(clientSocket)
+                }
+                synchronized(clientLock) {
+                    activeClient = clientSocket
+                    activeClientJob = job
+                    activeClientEstablished = false
+                    activeClientLastRequestNanos = System.nanoTime()
+                }
+                job.start()
             }
         } catch (e: Exception) {
             if (running) {
@@ -216,6 +270,7 @@ open class RtspHandler(
         socket.soTimeout = HANDSHAKE_IDLE_TIMEOUT_MS
         val inputStream = socket.getInputStream()
         val outputStream = socket.getOutputStream()
+        var established = false
 
         // Fresh pairing + FairPlay state for each control connection.
         pairingSession = PairingSession(PairingKeys.get(context)) { key ->
@@ -225,16 +280,36 @@ open class RtspHandler(
         // macOS may finish the PIN exchange on a new socket. The pending exchange has an owner and
         // expiry, while this connection starts unverified regardless of any previous pairing.
         currentRemoteAddress = socket.inetAddress
-
         try {
             while (running && !socket.isClosed) {
-                val request = requestReader.read(inputStream) ?: break
+                val request = try {
+                    requestReader.read(inputStream)
+                } catch (_: SocketTimeoutException) {
+                    if (established) {
+                        // A selected AirPlay route may legitimately go silent while paused or while
+                        // the user switches apps. Keep its TCP session until EOF/session teardown;
+                        // the accept loop can still evict it when a new sender arrives after grace.
+                        continue
+                    } else {
+                        Logger.d("Incomplete AirPlay handshake timed out")
+                    }
+                    break
+                } ?: break
+                synchronized(clientLock) {
+                    if (activeClient === socket) activeClientLastRequestNanos = System.nanoTime()
+                }
                 currentCSeq = request.headers["CSeq"]?.toIntOrNull() ?: 0
                 val response = routeRequest(request)
                 sendResponse(outputStream, response)
-                // Established media streams can keep control quiet for long periods. Apply the
-                // timeout only to discovery/pairing sockets that have not established a session.
+                // Poll established sockets so abandoned Wi-Fi sessions are reclaimed, while the
+                // media-activity signal below keeps a healthy quiet control channel alive.
                 if (establishesControlSession(request, response)) {
+                    established = true
+                    synchronized(clientLock) {
+                        if (activeClient === socket) activeClientEstablished = true
+                    }
+                    // Do not autonomously expire a selected but quiet AirPlay route. A new sender
+                    // still displaces an idle incumbent through decideIncomingClient().
                     socket.soTimeout = 0
                 }
 
@@ -263,19 +338,29 @@ open class RtspHandler(
                 )
             }
         } catch (e: Exception) {
-            if (running) Logger.e("Error handling RTSP client", e)
+            if (running && !socket.isClosed) Logger.e("Error handling RTSP client", e)
         } finally {
             Logger.i("Client disconnected")
             socket.close()
-            activeClient = null
-            currentSession = null
-            currentRemoteAddress = null
-            pairingSession = null
-            fairPlay = null
-            isMirrorSession = false
-            activeStreamTypes.clear()
-            setupCount = 0
-            onStreamingStopped()
+            val owned = synchronized(clientLock) {
+                if (activeClient === socket) {
+                    activeClient = null
+                    activeClientJob = null
+                    activeClientEstablished = false
+                    activeClientLastRequestNanos = 0L
+                    true
+                } else false
+            }
+            if (owned) {
+                currentSession = null
+                currentRemoteAddress = null
+                pairingSession = null
+                fairPlay = null
+                isMirrorSession = false
+                activeStreamTypes.clear()
+                setupCount = 0
+                if (established) onStreamingStopped()
+            }
         }
     }
 
@@ -855,27 +940,23 @@ open class RtspHandler(
     /**
      * Handles TEARDOWN. A TEARDOWN may target SPECIFIC streams (AirPlay 2 dynamic stream removal —
      * e.g. macOS drops the audio stream when playback stops) or the whole session. If the body lists
-     * streams and they're audio-only, we stop just the audio and KEEP the mirror running; otherwise
-     * we tear the whole session down. (Previously any TEARDOWN killed the mirror, so stopping audio
-     * on the Mac ended screen mirroring entirely.)
+     * streams, we stop only those streams and preserve the authenticated control/event/timing
+     * session even when no media streams remain. iOS uses a type-96 stream TEARDOWN for pause, then
+     * re-adds that stream on resume without repeating the key exchange. Only a bodyless/session
+     * TEARDOWN ends the whole session.
      */
     open fun handleTeardownInternal(request: RtspRequest): RtspResponse {
         val streamTypes = parseTeardownStreamTypes(request.bodyBytes)
         if (streamTypes != null && streamTypes.isNotEmpty()) {
             // Stream-level teardown: stop ONLY the listed streams. Keep the session (keys, NTP,
             // event channel) alive so the remaining stream keeps running and a stopped one can be
-            // re-added later — e.g. audio keeps playing with video gone, or video keeps mirroring
-            // with audio stopped. But if this removes the LAST active stream (e.g. macOS names both
-            // 96 and 110 to end the session), fall through to a full teardown so cleanup isn't left
-            // to the eventual socket close.
+            // re-added later — e.g. audio keeps playing with video gone, or a paused audio stream is
+            // re-created on resume using the keys retained by the live control session.
             if (streamTypes.contains(96)) { onMirrorAudioStop(); activeStreamTypes.remove(96) }
             if (streamTypes.contains(110)) { onMirrorVideoStop(); activeStreamTypes.remove(110) }
             if (streamTypes.contains(103)) { onBufferedAudioStop(); activeStreamTypes.remove(103) }
-            if (activeStreamTypes.isNotEmpty()) {
-                Logger.i("TEARDOWN streams=$streamTypes — stopped those, session continues (active=$activeStreamTypes)")
-                return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
-            }
-            Logger.i("TEARDOWN streams=$streamTypes — last stream removed, ending session")
+            Logger.i("TEARDOWN streams=$streamTypes — stopped those, control session continues (active=$activeStreamTypes)")
+            return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
         } else {
             Logger.i("TEARDOWN (session, body=${request.bodyBytes.size}B) — streaming stopping")
         }
@@ -947,14 +1028,17 @@ open class RtspHandler(
     }
 
     /** Handles FLUSH — macOS requests we discard buffered media data (seek/pause). */
-    private fun handleFlush(@Suppress("UNUSED_PARAMETER") request: RtspRequest): RtspResponse {
-        return RtspResponse(statusCode = 200, statusMessage = "OK")
+    private fun handleFlush(request: RtspRequest): RtspResponse {
+        onAudioFlush()
+        Logger.d("FLUSH received — queued audio discarded")
+        return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
     }
 
     /** Handles PAUSE — suspends media delivery. Responds 200 OK; resume arrives as RECORD. */
     open fun handlePauseInternal(request: RtspRequest): RtspResponse {
-        Logger.d("PAUSE received")
-        return RtspResponse(statusCode = 200, statusMessage = "OK")
+        onAudioFlush()
+        Logger.d("PAUSE received — control session retained")
+        return RtspResponse(statusCode = 200, statusMessage = "OK", protocol = request.responseProtocol())
     }
 
     /** Handles AirPlay photo sharing: HTTP `PUT /photo` with a JPEG/PNG body. */
@@ -1063,6 +1147,28 @@ open class RtspHandler(
 
 private fun RtspRequest.isPhotoRequest(): Boolean =
     uri.substringBefore("?") == PhotoHandler.PHOTO_PATH
+
+internal enum class IncomingClientDecision { ACCEPT, REPLACE_STALE, REJECT_BUSY }
+
+/**
+ * Keep a genuinely active sender stable, while never letting an abandoned socket monopolize
+ * port 7000. Incomplete handshakes are replaceable immediately; established sessions get a short
+ * grace period so a harmless discovery probe cannot interrupt current playback.
+ */
+internal fun decideIncomingClient(
+    hasActiveClient: Boolean,
+    activeSessionEstablished: Boolean,
+    controlIdleMillis: Long,
+    mediaRecentlyActive: Boolean = false,
+    staleAfterMillis: Long = 5_000L
+): IncomingClientDecision {
+    require(controlIdleMillis >= 0L && staleAfterMillis > 0L)
+    if (!hasActiveClient) return IncomingClientDecision.ACCEPT
+    if (!activeSessionEstablished || (!mediaRecentlyActive && controlIdleMillis >= staleAfterMillis)) {
+        return IncomingClientDecision.REPLACE_STALE
+    }
+    return IncomingClientDecision.REJECT_BUSY
+}
 
 private fun RtspRequest.responseProtocol(): String =
     if (protocol.startsWith("HTTP/")) protocol else "RTSP/1.0"

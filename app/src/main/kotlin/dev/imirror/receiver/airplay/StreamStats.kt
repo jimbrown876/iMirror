@@ -30,12 +30,26 @@ object StreamStats {
     @Volatile var audioActive = false  // true while an audio stream is running
     @Volatile var audioQueue = 0       // current playback-queue depth
     @Volatile var audioDupPct = 0      // % of RTP packets that were redundant duplicates
+    @Volatile private var lastMediaPacketNanos = 0L
+
+    /** Marks real media traffic so an idle RTSP control socket is not mistaken for a dead sender. */
+    fun markMediaPacket() {
+        lastMediaPacketNanos = System.nanoTime()
+    }
+
+    /** True only while audio/video bytes have arrived inside the bounded liveness window. */
+    fun hasRecentMediaPacket(maxIdleMillis: Long): Boolean {
+        require(maxIdleMillis > 0L)
+        val last = lastMediaPacketNanos
+        return last != 0L && (System.nanoTime() - last).coerceAtLeast(0L) <= maxIdleMillis * 1_000_000L
+    }
 
     /** Clears per-stream counters (call when a mirror session ends). Keeps [overlayEnabled]. */
     fun resetStreams() {
         videoRes = ""; videoFps = 0; videoQueue = 0; videoDropPct = 0
         videoWidth = 0; videoHeight = 0
         audioActive = false; audioQueue = 0; audioDupPct = 0
+        lastMediaPacketNanos = 0L
     }
 
     /** Human-readable multi-line HUD text. */

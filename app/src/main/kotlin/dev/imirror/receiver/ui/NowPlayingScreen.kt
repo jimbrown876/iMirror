@@ -30,7 +30,7 @@ import kotlinx.coroutines.withContext
  * screen fills the otherwise-black surface for audio-only sessions.
  *
  * Layout (centered): album art (or an AirPlay-glyph placeholder when the sender sends no artwork),
- * track title, artist, album, and a "♪ Audio from <sender>" footer. Built programmatically to match
+ * track title, artist, and album. Built programmatically to match
  * the other overlay views ([PhotoScreen]/[StreamingScreen]).
  */
 class NowPlayingScreen @JvmOverloads constructor(
@@ -43,7 +43,6 @@ class NowPlayingScreen @JvmOverloads constructor(
     private val titleView: TextView
     private val artistView: TextView
     private val albumView: TextView
-    private val senderView: TextView
     private val artworkRevision = ArtworkRevision()
     private val artworkDecodeLock = Mutex()
     private var artworkJob: Job? = null
@@ -76,15 +75,10 @@ class NowPlayingScreen @JvmOverloads constructor(
         albumView = textView(ALBUM_SP, R.color.text_tertiary).apply {
             setPadding(0, dp(4), 0, 0)
         }
-        senderView = textView(SENDER_SP, R.color.protocol_airplay).apply {
-            setPadding(0, dp(36), 0, 0)
-        }
-
         column.addView(artwork)
         column.addView(titleView)
         column.addView(artistView)
         column.addView(albumView)
-        column.addView(senderView)
 
         addView(
             column,
@@ -100,7 +94,6 @@ class NowPlayingScreen @JvmOverloads constructor(
         titleView.text = info.title ?: context.getString(R.string.now_playing_audio)
         artistView.setTextVisible(info.artist)
         albumView.setTextVisible(info.album)
-        senderView.text = context.getString(R.string.now_playing_from, info.senderName)
     }
 
     /** Releases the (potentially large) artwork bitmap when the card is hidden. */
@@ -195,6 +188,5 @@ class NowPlayingScreen @JvmOverloads constructor(
         private const val TITLE_SP = 30f
         private const val ARTIST_SP = 22f
         private const val ALBUM_SP = 17f
-        private const val SENDER_SP = 16f
     }
 }
