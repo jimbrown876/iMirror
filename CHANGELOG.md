@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve every missing packet interval inside the negotiated music recovery window after resend
+  retries expire, preventing a short unrecoverable Wi-Fi burst from compressing the song timeline
+  and sounding like repeated skips.
 - Preserve the authenticated AirPlay control session when iOS pauses music by tearing down only
   its type-96 audio stream, allowing a same-session SETUP to resume without losing FairPlay keys.
 - Flush queued PCM, RTP reorder, duplicate, decoder and AudioTrack state on FLUSH/PAUSE so stale

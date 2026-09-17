@@ -420,6 +420,7 @@ internal data class ReorderOutput(
 internal class RtpReorderBuffer(
     private val maximumTrackedPackets: Int = 128,
     private val holdNanos: Long,
+    private val maximumConcealmentPackets: Int = DEFAULT_MAXIMUM_CONCEALMENT_PACKETS,
     private val clockNanos: () -> Long = System::nanoTime
 ) {
     private val packets = HashMap<Int, ByteArray>()
@@ -433,6 +434,7 @@ internal class RtpReorderBuffer(
     init {
         require(maximumTrackedPackets > 0)
         require(holdNanos > 0)
+        require(maximumConcealmentPackets > 0)
     }
 
     @Synchronized
@@ -534,7 +536,7 @@ internal class RtpReorderBuffer(
     }
 
     private fun expireBufferedGaps(ready: MutableList<ReorderedPacket>) {
-        var concealmentRemaining = MAX_CONCEALMENT_PACKETS
+        var concealmentRemaining = maximumConcealmentPackets
         var skipped = 0
         // Drain every already-buffered island in one bounded pass. Sparse loss therefore gets one
         // wall-clock hold, not another full delay for each hole.
@@ -579,7 +581,7 @@ internal class RtpReorderBuffer(
         (((a - b) and 0xFFFF_FFFFL) xor 0x8000_0000L) - 0x8000_0000L
 
     private companion object {
-        const val MAX_CONCEALMENT_PACKETS = 4
+        const val DEFAULT_MAXIMUM_CONCEALMENT_PACKETS = 4
         const val DISCONTINUITY_IDLE_NANOS = 500_000_000L
     }
 }
@@ -681,7 +683,8 @@ class AudioStreamServer(
     private val sendLock = Any()                       // serialises control-socket resend sends
     private val reorderBuffer = RtpReorderBuffer(
         maximumTrackedPackets = MAX_RESEND_RANGE,
-        holdNanos = reorderBudgetMillis(codecType) * 1_000_000L
+        holdNanos = reorderBudgetMillis(codecType) * 1_000_000L,
+        maximumConcealmentPackets = concealmentBudgetPackets(codecType, sampleRate, packetFrames)
     )
     private val postFlushIngress = PostFlushIngressGate()
     private val resendRetry = ResendRetryPolicy()
@@ -1316,6 +1319,19 @@ class AudioStreamServer(
 
         internal fun reorderBudgetMillis(codecType: Int): Int =
             if (codecType == CT_AAC_ELD) 40 else MUSIC_REORDER_MILLIS
+
+        /**
+         * Preserve every packet interval that can expire inside the negotiated recovery window.
+         * A smaller fixed concealment cap compresses the media timeline after a music burst,
+         * making the recovered stream sound like it skips even though later packets are valid.
+         */
+        internal fun concealmentBudgetPackets(codecType: Int, sampleRate: Int, frames: Int): Int =
+            packetBudget(
+                sampleRate,
+                frames,
+                reorderBudgetMillis(codecType),
+                maximumPackets = MAX_RESEND_RANGE
+            )
 
         /**
          * Hard storage ceiling for packet bursts. Music capacity does not prebuffer this amount;

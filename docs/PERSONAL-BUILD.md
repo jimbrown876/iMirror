@@ -4,7 +4,13 @@ This GPL-3.0 personal fork retains upstream attribution and is based on
 `prat3ik/iMirror` main commit `9b52ce6d8bedb80ee557a5114d3cdbee4ab84f00`.
 It is not an Apple-certified receiver. No DRM bypass or paid service is included.
 
-## Current personal build: 1.0.6-personal (version code 7)
+## Current personal build: 1.0.7-personal (version code 8)
+
+- Preserve every missing packet interval inside the bounded music recovery window after resend
+  retries expire. This prevents a short unrecoverable Wi-Fi burst from deleting time and making
+  otherwise valid playback sound like repeated skips, without enlarging the latency budget.
+
+The version 1.0.6 discovery and weak-link audio repairs below are retained:
 
 - Keep an Android multicast lock for the receiver's advertising lifetime, wait for a usable LAN,
   and automatically refresh only the mDNS advertisements after Wi-Fi loss/rejoin, address changes,

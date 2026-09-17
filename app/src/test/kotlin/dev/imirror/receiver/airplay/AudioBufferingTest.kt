@@ -271,6 +271,12 @@ class AudioBufferingTest {
                 AudioStreamServer.CT_ALAC, 44100, 352, latencyMaxSamples = 88200
             )
         )
+        assertEquals(
+            9,
+            AudioStreamServer.concealmentBudgetPackets(
+                AudioStreamServer.CT_ALAC, 44100, 352
+            )
+        )
     }
 
     @Test
@@ -508,6 +514,29 @@ class AudioBufferingTest {
                 }
             }
         )
+        assertNull(released.gap)
+    }
+
+    @Test
+    fun `music recovery window preserves every missing packet interval`() {
+        var now = 0L
+        val reorder = RtpReorderBuffer(
+            maximumTrackedPackets = 128,
+            holdNanos = 75_000_000L,
+            maximumConcealmentPackets = 9
+        ) { now }
+        reorder.offer(100, 1_000, byteArrayOf(100))
+        val waiting = reorder.offer(110, 4_520, byteArrayOf(110))
+        assertEquals(ResendRange(101, 9), waiting.gap)
+
+        now = 75_000_000L
+        val released = reorder.expireGapIfDue()
+        assertTrue(released.expiredGap)
+        assertEquals(9, released.silencePackets)
+        assertArrayEquals(byteArrayOf(110), released.encodedFrames.single())
+        assertEquals(110, released.playoutFrames.last().let { frame ->
+            (frame as ReorderedPacket.Encoded).bytes.single().toInt() and 0xFF
+        })
         assertNull(released.gap)
     }
 

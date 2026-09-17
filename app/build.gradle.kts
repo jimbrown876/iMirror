@@ -19,8 +19,8 @@ android {
         // 25 = Android 7.1. Covers Fire TV, older Android TV boxes, and phones used for testing.
         minSdk = 25
         targetSdk = 35
-        versionCode = 7
-        versionName = "1.0.6-personal"
+        versionCode = 8
+        versionName = "1.0.7-personal"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
