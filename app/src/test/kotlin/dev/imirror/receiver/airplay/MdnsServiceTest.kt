@@ -12,6 +12,9 @@ import android.os.Looper
 import android.system.OsConstants
 import dev.imirror.receiver.service.ProtocolState
 import dev.imirror.receiver.util.NetworkUtils
+import dev.imirror.receiver.airplay.handshake.PairingKeys
+import dev.imirror.receiver.airplay.handshake.InfoResponder
+import dev.imirror.receiver.airplay.handshake.PlistCodec
 import io.mockk.Runs
 import io.mockk.every
 import io.mockk.just
@@ -52,6 +55,8 @@ class MdnsServiceTest {
     @Before
     fun setup() {
         mockkObject(NetworkUtils)
+        mockkObject(PairingKeys.Companion)
+        every { PairingKeys.get(context) } returns PairingKeys.create(ByteArray(32) { 3 })
         every { NetworkUtils.getMacAddress(context) } returns "02:11:22:33:44:55"
         every { NetworkUtils.getPersistentUuid(context) } returns "fixture-uuid"
         every { NetworkUtils.getDeviceName(context) } returns "Bedroom"
@@ -107,6 +112,17 @@ class MdnsServiceTest {
         val (info, listener) = registrations[index]
         if (name != null) info.serviceName = name
         listener.onServiceRegistered(info)
+    }
+
+    @Test
+    fun `both discovery records publish the same pairing identity as setup`() {
+        startOnline()
+        registered(0)
+        val setupKey = PlistCodec.decode(InfoResponder.build(context))["pk"] as ByteArray
+        val expected = setupKey.joinToString("") { "%02x".format(it) }
+        assertEquals(64, expected.length)
+        assertEquals(expected, registrations[0].first.attributes["pk"]?.toString(Charsets.US_ASCII))
+        assertEquals(expected, registrations[1].first.attributes["pk"]?.toString(Charsets.US_ASCII))
     }
 
     @Test

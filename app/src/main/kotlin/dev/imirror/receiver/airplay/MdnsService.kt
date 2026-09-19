@@ -13,6 +13,7 @@ import android.system.OsConstants
 import dev.imirror.receiver.service.ProtocolState
 import dev.imirror.receiver.util.Logger
 import dev.imirror.receiver.util.NetworkUtils
+import dev.imirror.receiver.airplay.handshake.PairingKeys
 import java.net.Inet4Address
 import java.net.Inet6Address
 
@@ -473,6 +474,9 @@ class MdnsService(
      *
      * @param displayName The name shown in sender AirPlay pickers.
      */
+    private fun pairingPublicKeyHex(): String =
+        PairingKeys.get(context).edPublic.joinToString("") { "%02x".format(it) }
+
     private fun registerAirPlayService(displayName: String) {
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = displayName
@@ -486,6 +490,7 @@ class MdnsService(
             setAttribute("srcvers", AIRPLAY_SERVER_VERSION)
             setAttribute("vv", "2")                             // AirPlay protocol version 2
             setAttribute("pi", NetworkUtils.getPersistentUuid(context))
+            setAttribute("pk", pairingPublicKeyHex())
             setAttribute("flags", "0x4")                        // Screen-mirroring receiver
         }
 
@@ -535,6 +540,7 @@ class MdnsService(
             setAttribute("vn", "65537")            // Version number (required)
             setAttribute("vs", AIRPLAY_SERVER_VERSION)
             setAttribute("am", AIRPLAY_MODEL)
+            setAttribute("pk", pairingPublicKeyHex())
         }
 
         raopListener = createRegistrationListener(
