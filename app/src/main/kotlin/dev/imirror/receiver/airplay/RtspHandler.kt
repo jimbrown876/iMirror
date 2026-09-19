@@ -403,17 +403,29 @@ open class RtspHandler(
                                 request.uri.substringBefore('?').takeIf { it.startsWith('/') && it.length < 40 })
                             return
                         }
-                        val sessionId = videoSessionId(request) ?: return
+                        val sessionId = videoSessionId(request) ?: run {
+                            Logger.w("Video companion rejected: missing or invalid HTTP session ID")
+                            return
+                        }
                         synchronized(clientLock) {
                             if (activeClient !== incumbent || incumbent.isClosed) return
-                            if (videoCompanionSessionId != null && videoCompanionSessionId != sessionId) return
+                            if (videoCompanionSessionId != null && videoCompanionSessionId != sessionId) {
+                                Logger.w("Video companion rejected: HTTP session ID differs from active video session")
+                                return
+                            }
                             videoCompanionSessionId = sessionId
                         }
                         Logger.d("Video companion ${request.method} ${request.uri.substringBefore('?')}")
                         if (request.uri == "/reverse") {
                             synchronized(clientLock) {
-                                if (!isVideoReverseUpgrade(request) || videoReverseSocket != null ||
-                                    activeClient !== incumbent || incumbent.isClosed) return
+                                if (!isVideoReverseUpgrade(request)) {
+                                    Logger.w("Video reverse rejected: invalid upgrade headers or body")
+                                    return
+                                }
+                                if (videoReverseSocket != null || activeClient !== incumbent || incumbent.isClosed) {
+                                    Logger.w("Video reverse rejected: event channel already owned or primary closed")
+                                    return
+                                }
                                 videoReverseSocket = socket
                             }
                             reverse = true
