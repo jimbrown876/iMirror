@@ -683,18 +683,17 @@ class AirPlayReceiver(
         emitState(ProtocolState.CONNECTED)   // shows StreamingScreen → Surface becomes available
         val player = urlVideoPlayer ?: AirPlayVideoPlayer(
             surfaceProvider = videoSurfaceProvider,
-            onEnded = { stopUrlVideo() }
+            onFailure = { Logger.w("URL video failed; parent AirPlay route retained for retry") }
         ).also { urlVideoPlayer = it }
         player.play(url, startFraction)
         Logger.i("AirPlay URL video started: $url (start=$startFraction)")
     }
 
-    /** Stops AirPlay video URL playback (POST /stop or end-of-media) and ends the session. */
+    /** Stops this URL item only; RTSP TEARDOWN owns the parent event/timing/key lifecycle. */
     private fun stopUrlVideo() {
         urlVideoPlayer?.release()
         urlVideoPlayer = null
-        onStreamingStopped()
-        Logger.i("AirPlay URL video stopped")
+        Logger.i("AirPlay URL video stopped; parent route retained")
     }
 
     /** Starts the AirPlay 2 buffered audio-only stream (type 103, Apple Music → TV); returns its TCP port. */

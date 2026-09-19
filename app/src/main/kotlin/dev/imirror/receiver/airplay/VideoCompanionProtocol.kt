@@ -45,6 +45,7 @@ internal fun isVideoReverseUpgrade(request: RtspRequest): Boolean =
 internal fun videoEventState(requested: Boolean, info: PlaybackInfo?): String? = when {
     !requested -> null
     info == null -> "stopped"
+    info.completed -> "stopped"
     !info.readyToPlay -> "loading"
     info.rate > 0 -> "playing"
     else -> "paused"

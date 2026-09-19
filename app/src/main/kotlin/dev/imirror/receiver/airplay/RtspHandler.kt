@@ -696,8 +696,9 @@ open class RtspHandler(
             return RtspResponse(400, "Bad Request", protocol = request.responseProtocol())
         }
         Logger.i("POST /play url=$url start=$start")
-        urlVideoRequested = true
         onVideoPlay(url, start)
+        // The callback must publish its pending/loading snapshot before the reverse channel polls.
+        urlVideoRequested = true
         return RtspResponse(200, "OK", protocol = request.responseProtocol())
     }
 

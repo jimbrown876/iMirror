@@ -13,6 +13,30 @@ import org.junit.Test
 
 class AudioVolumeAndReceiveTest {
     @Test
+    fun `stopping URL video retains parent event channel keys and active session`() {
+        val context = mockk<Context>(relaxed = true)
+        every { context.getSystemService(Context.NSD_SERVICE) } returns mockk<NsdManager>(relaxed = true)
+        val receiver = AirPlayReceiver(context, videoSurfaceProvider = { null }, onStateChanged = {})
+        val video = mockk<AirPlayVideoPlayer>(relaxed = true)
+        val event = mockk<java.net.ServerSocket>(relaxed = true)
+        val key = ByteArray(16) { 7 }
+        setField(receiver, "urlVideoPlayer", video)
+        setField(receiver, "eventSocket", event)
+        setField(receiver, "mirrorAesKey", key)
+        val gate = field(receiver, "mediaSession") as MediaSessionGate
+        gate.activate()
+
+        invokeNoArgs(receiver, "stopUrlVideo")
+
+        verify(exactly = 1) { video.release() }
+        verify(exactly = 0) { event.close() }
+        assertSame(key, field(receiver, "mirrorAesKey"))
+        assertSame(event, field(receiver, "eventSocket"))
+        assertNull(field(receiver, "urlVideoPlayer"))
+        assertTrue(gate.endOnce().ended)
+    }
+
+    @Test
     fun `volume reaches legacy and realtime players and is retained before setup`() {
         val context = mockk<Context>(relaxed = true)
         every { context.getSystemService(Context.NSD_SERVICE) } returns mockk<NsdManager>(relaxed = true)
