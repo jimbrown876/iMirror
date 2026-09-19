@@ -2,6 +2,11 @@ package dev.imirror.receiver.airplay
 
 import dev.imirror.receiver.airplay.handshake.PlistCodec
 
+// /server-info is the legacy HTTP video endpoint, not the RTSP /info capability mask.
+// Advertise implemented clear video, photos and audio (bits 0, 1, 9), not FairPlay-protected
+// URL video, HLS playlist proxying, slideshows or modern protocols this endpoint cannot serve.
+internal const val HTTP_VIDEO_FEATURES = 0x203L
+
 /** Only URL-video commands belong on authenticated companion HTTP sockets, never RTSP media setup. */
 internal fun isVideoCompanionRequest(request: RtspRequest): Boolean {
     if (request.protocol != "HTTP/1.1") return false

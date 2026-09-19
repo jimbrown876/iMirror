@@ -6,15 +6,21 @@ It is not an Apple-certified receiver. No DRM bypass or paid service is included
 
 ## Candidate personal build: 1.0.9-personal (version code 10)
 
-- **Work in progress: Mac URL video does not yet play.** Native Safari reproduced additional
+- **Work in progress: Mac clear-URL video now renders on Bedroom; full regression is incomplete.**
+  Native Safari reproduced additional
   same-controller RTSP pair-verification sockets followed by HTTP video commands. The previous
   one-client gate rejected them, causing sender teardown. The candidate independently verifies
   each bounded companion socket against the primary controller identity, restricts commands to
   URL-video controls, binds their HTTP session IDs, and implements the reverse-event upgrade.
   Companion crypto and response sequence numbers are separate from the primary audio session.
-- Physical Safari testing progressed through `/server-info`, independent v3 `/fp-setup`, explicit
-  HTTP 421 rejection of unsupported `/fp-setup2` (matching UxPlay), and default `selectedMediaArray`
-  initialization. The sender still has not sent `/play`; no rendered-video or latency pass is claimed.
+- Mac sender logs established that HTTP 421 for unsupported `/fp-setup2` aborts video authentication;
+  later property requests did not prove fallback. The legacy HTTP `/server-info` now advertises
+  clear video, photo and audio only (`0x203`), not the full RTSP/mDNS mask or unsupported protected
+  URL-video/HLS-proxy features. RTSP audio/mirroring advertisement is unchanged. Native Safari then
+  sends `/reverse` and `/play`. Bedroom physically rendered different frames from the W3C-hosted
+  52-second H.264/AAC Sintel trailer, with advancing sender position and functional pause/resume.
+  Audible sound, repeated reconnects, timing thresholds, screen mirroring, five-minute stability,
+  original iPhone/AirPods reproduction and Living Room remain unverified or failed.
   Unsupported non-default properties remain explicit errors. Empty HTTP responses have an explicit
   zero Content-Length except for body-forbidden statuses such as the 101 upgrade. Fresh-pairing
   identity, route allowlist, framing and default-property tests

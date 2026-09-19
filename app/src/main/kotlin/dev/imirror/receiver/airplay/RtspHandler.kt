@@ -783,7 +783,7 @@ open class RtspHandler(
     private fun handleServerInfo(request: RtspRequest): RtspResponse {
         val info = mapOf(
             "deviceid" to dev.imirror.receiver.util.NetworkUtils.getMacAddress(context),
-            "features" to 0x1E5A7FFFF7L,
+            "features" to HTTP_VIDEO_FEATURES,
             "model" to "AppleTV5,3",
             "protovers" to "1.1",
             "srcvers" to "220.68",

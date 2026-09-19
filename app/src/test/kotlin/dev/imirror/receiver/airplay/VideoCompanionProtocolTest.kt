@@ -6,6 +6,11 @@ import org.junit.Test
 import java.io.ByteArrayInputStream
 
 class VideoCompanionProtocolTest {
+    @Test fun `HTTP video capabilities do not claim unsupported protected video or HLS proxying`() {
+        assertEquals(0x203L, HTTP_VIDEO_FEATURES)
+        assertEquals(0L, HTTP_VIDEO_FEATURES and ((1L shl 2) or (1L shl 4) or (1L shl 12)))
+    }
+
     private fun request(method: String = "POST", path: String = "/reverse", protocol: String = "HTTP/1.1",
                         headers: Map<String, String> = mapOf("X-Apple-Session-ID" to "test-session",
                             "Connection" to "keep-alive, Upgrade", "Upgrade" to "PTTH/1.0", "X-Apple-Purpose" to "event")) =
