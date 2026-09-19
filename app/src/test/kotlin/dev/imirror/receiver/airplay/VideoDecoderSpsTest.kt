@@ -167,6 +167,24 @@ class VideoDecoderSpsTest {
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
 
+    @Test
+    fun `mirroring Annex B configuration preserves SPS dimensions`() {
+        val sps = buildBaselineSps(66, 31, 79, 44)
+        for (prefix in listOf(byteArrayOf(0, 0, 1), byteArrayOf(0, 0, 0, 1))) {
+            assertEquals(Pair(1280, 720), VideoDecoder.parseSpsResolution(prefix + sps))
+        }
+    }
+
+    @Test
+    fun `SPS emulation prevention bytes do not become syntax bits`() {
+        // A valid Baseline SPS with a zero constraint/level pair requires 03 escaping
+        // when the following syntax byte is <= 03. Exercise the RBSP reader directly.
+        val reader = SpsBitReader(byteArrayOf(0, 0, 3, 1, 0x42), 0)
+        assertEquals(0, reader.readBits(16))
+        assertEquals(1, reader.readBits(8))
+        assertEquals(0x42, reader.readBits(8))
+    }
+
     /**
      * Builds a minimal but valid H.264 SPS byte array for Baseline or Main profile.
      * Uses [SpsBitWriter] to produce the exact Exp-Golomb bit patterns that

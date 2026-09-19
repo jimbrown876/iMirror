@@ -313,8 +313,17 @@ class VideoDecoder(private val outputSurface: Surface) {
          */
         internal fun parseSpsResolution(sps: ByteArray): Pair<Int, Int>? {
             try {
-                if (sps.size < 4) return null
-                val reader = SpsBitReader(sps, startOffset = 1)  // skip NAL type byte (0x67)
+                // MirrorStreamServer supplies Annex-B CSD; legacy SDP supplies a raw NAL.
+                // Skip only the framing prefix before interpreting the SPS syntax.
+                val nalOffset = when {
+                    sps.size >= 4 && sps[0] == 0.toByte() && sps[1] == 0.toByte() &&
+                        sps[2] == 0.toByte() && sps[3] == 1.toByte() -> 4
+                    sps.size >= 3 && sps[0] == 0.toByte() && sps[1] == 0.toByte() &&
+                        sps[2] == 1.toByte() -> 3
+                    else -> 0
+                }
+                if (sps.size - nalOffset < 4 || sps[nalOffset].toInt() and 0x1f != 7) return null
+                val reader = SpsBitReader(sps, startOffset = nalOffset + 1)
 
                 val profileIdc = reader.readBits(8)
                 reader.readBits(8)   // constraint flags + 2 reserved zeros
@@ -419,8 +428,26 @@ class VideoDecoder(private val outputSurface: Surface) {
          * @param data        The raw SPS byte array (including NAL type header).
          * @param startOffset Byte offset to start reading from (typically 1 to skip NAL type).
          */
-        class SpsBitReader(private val data: ByteArray, startOffset: Int) {
-            private var bytePos = startOffset
+        class SpsBitReader(data: ByteArray, startOffset: Int) {
+            // H.264 byte-stream escaping inserts 03 after 00 00. It is not an RBSP bit.
+            // This is the same framing rule used by AndroidX Media3's NalUnitUtil.
+            private val data: ByteArray = run {
+                require(startOffset in 0..data.size)
+                val rbsp = ByteArray(data.size - startOffset)
+                var size = 0
+                var zeros = 0
+                for (index in startOffset until data.size) {
+                    val value = data[index].toInt() and 0xff
+                    if (zeros == 2 && value == 3) {
+                        zeros = 0
+                        continue
+                    }
+                    rbsp[size++] = data[index]
+                    zeros = if (value == 0) minOf(zeros + 1, 2) else 0
+                }
+                rbsp.copyOf(size)
+            }
+            private var bytePos = 0
             private var bitPos  = 7  // MSB first (bit 7 = most significant)
 
             fun readBit(): Int {

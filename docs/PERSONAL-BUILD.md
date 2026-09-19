@@ -4,7 +4,20 @@ This GPL-3.0 personal fork retains upstream attribution and is based on
 `prat3ik/iMirror` main commit `9b52ce6d8bedb80ee557a5114d3cdbee4ab84f00`.
 It is not an Apple-certified receiver. No DRM bypass or paid service is included.
 
-## Current personal build: 1.0.8-personal (version code 9)
+## Candidate personal build: 1.0.9-personal (version code 10)
+
+- Parse raw and Annex-B-prefixed H.264 SPS configurations and remove emulation-prevention
+  bytes before reading syntax. The mirroring caller supplies Annex-B; parsing it as raw SPS
+  formerly selected incorrect dimensions or fell back to hints. Two regression tests failed
+  before the repair and pass afterward. Framing was checked against AndroidX Media3
+  `NalUnitUtil` and `ParsableNalUnitBitArray`.
+- Physical playback validation is in progress. Mac Music on the previous build negotiated
+  legacy FairPlay v2 and muted after only 3 of 24 ALAC frames decoded. This remains unresolved;
+  successful control setup must not be reported as audio playback success.
+- Bedroom was discoverable while TCL standby had frozen the app process. Normal TV wake
+  thawed it and resumed RTSP handling. No always-available deep-standby claim is made.
+
+The version 1.0.8 repairs below are retained:
 
 - Answer supplemental mDNS queries over both IPv4 and IPv6, and refresh advertisements when a
   preferred IPv6 privacy address rotates. This removes stale endpoint selection from the phone's
