@@ -10,10 +10,11 @@ package dev.imirror.receiver.airplay.handshake
  *   - v2 (`FPLY 02 …`): the RAOP audio path that Apple Music / iTunes use. Phase 1 has a
  *     single 142-byte reply whose mode byte (offset 13) is patched from `req[14]`.
  *
- * Both versions share the SAME phase-2 handshake and the SAME key-decryption core, so once
- * the right phase-1 reply gets the sender to hand over its key message + wrapped key, the
- * decrypt is identical. The reply blobs are fixed captures (no crypto), so they live here in
- * Kotlin; the final key decryption (`decrypt`) uses Apple's reverse-engineered FairPlay cipher
+ * This implementation attempts both versions through the same phase-2/key-decryption core.
+ * That does NOT establish v2 compatibility: physical Mac Music tests negotiated v2 but failed
+ * ALAC decoding. Legacy RAOP discovery therefore prefers the independently implemented RSA
+ * exchange. The reply blobs are fixed captures (no crypto), so they live here in Kotlin;
+ * final key decryption (`decrypt`) uses the reverse-engineered FairPlay cipher
  * + 483 KB of lookup tables — too large/obfuscated to hand-port safely — so it delegates to the
  * proven RPiPlay C compiled into `libplayfair.so` via JNI.
  *

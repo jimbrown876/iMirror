@@ -25,6 +25,26 @@ import javax.crypto.Cipher
  */
 object RaopRsa {
 
+    /**
+     * Legacy RAOP receiver authentication, separate from stream-key OAEP decryption.
+     * Wire format follows shairport-sync rtsp.c apple_challenge: challenge + the accepted
+     * socket's local IP + advertised six-byte device ID, padded to at least 32 bytes.
+     * This is a raw PKCS#1 v1.5 private-key operation, NOT a hashed RSA signature.
+     */
+    fun challengeResponse(challengeText: String, localAddress: ByteArray, deviceAddress: String): String {
+        require(challengeText.matches(Regex("[A-Za-z0-9+/]{22}(==)?"))) { "invalid Apple-Challenge" }
+        require(localAddress.size == 4 || localAddress.size == 16) { "invalid local IP" }
+        require(deviceAddress.matches(Regex("[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}"))) { "invalid receiver ID" }
+        val challenge = org.bouncycastle.util.encoders.Base64.decode(challengeText.padEnd(24, '='))
+        require(challenge.size == 16) { "invalid challenge size" }
+        val device = deviceAddress.split(':').map { it.toInt(16).toByte() }.toByteArray()
+        val message = challenge + localAddress + device
+        val cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding")
+        cipher.init(Cipher.ENCRYPT_MODE, privateKey)
+        val response = cipher.doFinal(message.copyOf(maxOf(32, message.size)))
+        return org.bouncycastle.util.encoders.Base64.toBase64String(response).trimEnd('=')
+    }
+
     /** RSA-OAEP-SHA1 transformation; the default provider (Conscrypt on Android) implements it. */
     private const val TRANSFORM = "RSA/ECB/OAEPWithSHA-1AndMGF1Padding"
 

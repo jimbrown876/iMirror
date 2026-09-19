@@ -1104,12 +1104,31 @@ open class RtspHandler(
 
     /** Handles OPTIONS — macOS asks what RTSP methods are supported. */
     open fun handleOptionsInternal(request: RtspRequest): RtspResponse {
+        val headers = mutableMapOf(
+            "Public" to "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER"
+        )
+        val challenge = request.headers.entries.firstOrNull {
+            it.key.equals("Apple-Challenge", ignoreCase = true)
+        }?.value
+        if (challenge != null) {
+            val localAddress = activeClient?.localAddress?.address
+                ?: return RtspResponse(503, "Service Unavailable", protocol = request.responseProtocol())
+            try {
+                headers["Apple-Response"] = dev.imirror.receiver.airplay.handshake.RaopRsa.challengeResponse(
+                    challenge, localAddress, dev.imirror.receiver.util.NetworkUtils.getMacAddress(context))
+                Logger.d("Legacy RAOP challenge answered (IPv${if (localAddress.size == 4) 4 else 6})")
+            } catch (_: IllegalArgumentException) {
+                return RtspResponse(400, "Bad Request", protocol = request.responseProtocol())
+            } catch (e: java.security.GeneralSecurityException) {
+                Logger.w("Legacy RAOP challenge signing unavailable")
+                return RtspResponse(500, "Internal Server Error", protocol = request.responseProtocol())
+            }
+        }
         return RtspResponse(
             statusCode = 200,
             statusMessage = "OK",
-            headers = mapOf(
-                "Public" to "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER"
-            )
+            headers = headers,
+            protocol = request.responseProtocol()
         )
     }
 

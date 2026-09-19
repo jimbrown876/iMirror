@@ -144,6 +144,15 @@ class MdnsServiceTest {
     }
 
     @Test
+    fun `legacy RSA advertisement leaves modern AirPlay features intact`() {
+        startOnline()
+        registered(0)
+        assertEquals("0,1", registrations[0].first.attributes["et"]?.toString(Charsets.US_ASCII))
+        assertEquals("0,1", registrations[0].first.attributes["cn"]?.toString(Charsets.US_ASCII))
+        assertEquals("0x5A7FFFF7,0x1E", registrations[1].first.attributes["features"]?.toString(Charsets.US_ASCII))
+    }
+
+    @Test
     fun `duplicate start and callbacks cannot create duplicate registrations`() {
         startOnline()
         service.start()

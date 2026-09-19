@@ -6,6 +6,16 @@ It is not an Apple-certified receiver. No DRM bypass or paid service is included
 
 ## Candidate personal build: 1.0.9-personal (version code 10)
 
+- Candidate legacy audio negotiation follows shairport-sync's separate RAOP profile (`et=0,1`,
+  PCM/ALAC codecs) rather than advertising the failing FairPlay v2 route. The existing RSA-OAEP
+  key decoder is complemented by Apple-Challenge responses bound to the accepted socket's local
+  IPv4/IPv6 address and the same six-byte identity used in discovery. Tests recover the signed
+  response and check its exact payload/padding; malformed challenges are rejected. Modern
+  `_airplay` features, v3 pairing/mirroring and HTTP video are unchanged. Physical compatibility
+  testing is required; this is not a claim of Mac Music playback success.
+  References: [shairport-sync Bonjour profile](https://github.com/mikebrady/shairport-sync/blob/master/bonjour_strings.c),
+  [receiver challenge handling](https://github.com/mikebrady/shairport-sync/blob/master/rtsp.c), and
+  [AirPort authentication wire format](https://openairplay.github.io/airplay-spec/audio/airport_express_authentication.html).
 - Legacy music startup prepares its audio player and binds the UDP port before returning from
   the RECORD callback. Previously that preparation was queued behind main-thread UI work, so
   a successful response could precede a usable audio endpoint. Two regression tests reproduce

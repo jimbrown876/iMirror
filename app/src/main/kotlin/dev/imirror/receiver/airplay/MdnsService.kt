@@ -531,9 +531,12 @@ class MdnsService(
             serviceType = SERVICE_TYPE_RAOP
             port = AIRPLAY_PORT
 
-            setAttribute("cn", "0,1,2,3")        // Cipher numbers (encryption types)
+            setAttribute("cn", "0,1")             // Legacy PCM/ALAC; AAC is on the modern audio path
             setAttribute("da", "true")             // Digest authentication capable
-            setAttribute("et", "0,3,5")            // Encryption types supported
+            // Legacy RAOP: use the implemented RSA key exchange, as shairport-sync does.
+            // Advertising FairPlay here sends Music.app down the unverified v2 key path.
+            // Modern /info, _airplay discovery and v3 mirroring/video remain unchanged.
+            setAttribute("et", "0,1")
             setAttribute("md", "0,1,2")            // Metadata types supported
             setAttribute("sv", "false")            // Software volume control
             setAttribute("tp", "UDP")              // Transport for audio RTP
