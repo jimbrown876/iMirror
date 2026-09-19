@@ -21,6 +21,14 @@ It is not an Apple-certified receiver. No DRM bypass or paid service is included
   52-second H.264/AAC Sintel trailer, with advancing sender position and functional pause/resume.
   Audible sound, repeated reconnects, timing thresholds, screen mirroring, five-minute stability,
   original iPhone/AirPods reproduction and Living Room remain unverified or failed.
+- URL-video completion and item-level stop no longer close the parent RTSP event/timing channels or
+  discard session keys. Player commands/callbacks run on the main Looper thread, with immutable
+  network-readable state and immediate pending-play reporting to prevent a false stopped event.
+  The physical Bedroom test reached EOF, kept the selected route, and replayed visible video without
+  reconnecting or restarting the app. This is a focused lifecycle pass, not the full regression gate.
+- Both discovery services publish the persistent Ed25519 public key used by `/info` and pairing.
+  Mac logs had reported `NULL Public Key` before contacting the video endpoint when this record was
+  absent. A regression test failed before the fix, and the subsequent physical session reached video.
   Unsupported non-default properties remain explicit errors. Empty HTTP responses have an explicit
   zero Content-Length except for body-forbidden statuses such as the 101 upgrade. Fresh-pairing
   identity, route allowlist, framing and default-property tests
