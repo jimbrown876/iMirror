@@ -39,6 +39,10 @@ class PairingSession(
 
     val isVerified: Boolean get() = sharedSecret != null
 
+    /** Identity comparison only; a companion socket still needs its own fresh M1/M2 proof. */
+    fun isVerifiedController(publicKey: ByteArray): Boolean =
+        isVerified && edTheirsPublic?.let { MessageDigest.isEqual(it, publicKey) } == true
+
     /** POST /pair-setup → our 32-byte Ed25519 public key. */
     fun pairSetup(requestBody: ByteArray): ByteArray {
         require(requestBody.size == 32) { "pair-setup expects 32 bytes, got ${requestBody.size}" }

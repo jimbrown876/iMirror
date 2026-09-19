@@ -154,6 +154,12 @@ open class RtspHandler(
     private var activeClient: Socket? = null
     private var activeClientGeneration = 0L
     private val clientLock = Any()
+    // Never hold clientLock across media callbacks: audio failures acquire it under audioServerLock.
+    private val mediaControlLock = Any()
+    private val videoCompanions = mutableSetOf<Socket>()
+    private var videoCompanionSessionId: String? = null
+    private var videoReverseSocket: Socket? = null
+    @Volatile private var urlVideoRequested = false
     @Volatile private var activeClientJob: Job? = null
     @Volatile private var activeClientEstablished = false
     @Volatile private var activeClientLastRequestNanos = 0L
@@ -215,6 +221,7 @@ open class RtspHandler(
         val client: Socket?
         val server: ServerSocket?
         synchronized(clientLock) {
+            closeVideoCompanions()
             client = activeClient
             server = serverSocket
             activeClient = null
@@ -314,7 +321,19 @@ open class RtspHandler(
 
                 when (decision) {
                     IncomingClientDecision.REJECT_BUSY -> {
-                        Logger.w("Rejecting second client — active sender is still healthy")
+                        val owner = pairingSession
+                        val inspect = synchronized(clientLock) {
+                            if (owner?.isVerified == true && existing === activeClient &&
+                                existing?.inetAddress == clientSocket.inetAddress && videoCompanions.size < 4) {
+                                videoCompanions.add(clientSocket)
+                                true
+                            } else false
+                        }
+                        if (inspect) {
+                            scope.launch(Dispatchers.IO) { handleVideoCompanion(clientSocket, existing!!, owner!!) }
+                            continue
+                        }
+                        Logger.w("Rejecting second sender — active sender is still healthy")
                         sendServiceUnavailable(clientSocket)
                         clientSocket.close()
                         continue
@@ -351,6 +370,128 @@ open class RtspHandler(
         }
     }
 
+    /** Authenticated URL-video HTTP and reverse-event channels belonging to the active controller. */
+    private fun handleVideoCompanion(socket: Socket, incumbent: Socket, owner: PairingSession) {
+        val timeout = java.util.Timer("video-companion-handshake", true)
+        timeout.schedule(object : java.util.TimerTask() {
+            override fun run() { runCatching { socket.close() } }
+        }, 5_000L)
+        try {
+            socket.soTimeout = 5_000
+            val pairing = PairingSession(PairingKeys.get(context), owner::isVerifiedController)
+            val companionFairPlay = FairPlay()
+            val reader = RtspRequestReader(maxMessageBytes = MAX_MESSAGE_BYTES, maxPhotoBytes = 4096)
+            while (running && !socket.isClosed) {
+                val request = reader.read(socket.getInputStream()) ?: return
+                var reverse = false
+                val response = synchronized(mediaControlLock) {
+                    if (activeClient !== incumbent || incumbent.isClosed || pairingSession !== owner) return
+                    if (!pairing.isVerified) {
+                        if (request.method != "POST" || request.uri != "/pair-verify" ||
+                            request.protocol != "RTSP/1.0") return
+                        val body = pairing.pairVerify(request.bodyBytes)
+                        if (pairing.isVerified) {
+                            timeout.cancel()
+                            socket.soTimeout = 0
+                            Logger.i("Video companion independently authenticated")
+                        }
+                        RtspResponse(200, "OK", bodyBytes = body, contentType = OCTET_STREAM,
+                            protocol = request.responseProtocol())
+                    } else {
+                        if (!isVideoCompanionRequest(request)) {
+                            Logger.w("Unsupported video companion request: ${request.method} " +
+                                request.uri.substringBefore('?').takeIf { it.startsWith('/') && it.length < 40 })
+                            return
+                        }
+                        val sessionId = videoSessionId(request) ?: return
+                        synchronized(clientLock) {
+                            if (activeClient !== incumbent || incumbent.isClosed) return
+                            if (videoCompanionSessionId != null && videoCompanionSessionId != sessionId) return
+                            videoCompanionSessionId = sessionId
+                        }
+                        Logger.d("Video companion ${request.method} ${request.uri.substringBefore('?')}")
+                        if (request.uri == "/reverse") {
+                            synchronized(clientLock) {
+                                if (!isVideoReverseUpgrade(request) || videoReverseSocket != null ||
+                                    activeClient !== incumbent || incumbent.isClosed) return
+                                videoReverseSocket = socket
+                            }
+                            reverse = true
+                            RtspResponse(101, "Switching Protocols", protocol = "HTTP/1.1",
+                                headers = mapOf("Connection" to "Upgrade", "Upgrade" to "PTTH/1.0"))
+                        } else if (request.method == "POST" && request.uri == "/fp-setup") {
+                            handleFpSetup(request, companionFairPlay)
+                        } else if (request.method == "POST" && request.uri == "/fp-setup2") {
+                            // UxPlay explicitly rejects this unsupported variant with 421. Do not
+                            // fake a successful crypto exchange or drop the authenticated channel.
+                            RtspResponse(421, "Misdirected Request", protocol = "HTTP/1.1",
+                                contentType = "application/x-apple-binary-plist")
+                        } else if (request.method == "PUT" && request.uri.substringBefore('?') == "/setProperty") {
+                            val property = request.uri.substringAfter('?', "").substringBefore('=')
+                            val value = runCatching { PlistCodec.decode(request.bodyBytes)["value"] }.getOrNull()
+                            val accepted = isDefaultVideoProperty(property, value)
+                            Logger.i("Video property ${property.take(40)} defaultAccepted=$accepted")
+                            RtspResponse(if (accepted) 200 else 501, if (accepted) "OK" else "Not Implemented",
+                                bodyBytes = PlistCodec.encodeXml(mapOf("errorCode" to if (accepted) 0L else -1L)),
+                                contentType = "text/x-apple-plist+xml", protocol = "HTTP/1.1")
+                        } else if (request.method == "GET") {
+                            routeGet(request)
+                        } else {
+                            routePost(request)
+                        }
+                    }
+                }
+                sendResponse(socket.getOutputStream(), response,
+                    request.headers["CSeq"]?.toIntOrNull() ?: 0)
+                if (reverse) {
+                    runVideoReverse(socket, incumbent, videoSessionId(request)!!)
+                    return
+                }
+            }
+        } catch (_: Exception) {
+            Logger.d("Video companion closed; primary sender session retained")
+        } finally {
+            timeout.cancel()
+            runCatching { socket.close() }
+            synchronized(clientLock) {
+                videoCompanions.remove(socket)
+                if (videoReverseSocket === socket) videoReverseSocket = null
+                if (videoCompanions.isEmpty()) videoCompanionSessionId = null
+            }
+        }
+    }
+
+    private fun runVideoReverse(socket: Socket, incumbent: Socket, sessionId: String) {
+        val reader = RtspRequestReader(4096, 4096)
+        var previous: String? = null
+        var lastEventNanos = 0L
+        socket.soTimeout = 5_000
+        while (running && !socket.isClosed) {
+            synchronized(clientLock) {
+                if (activeClient !== incumbent || incumbent.isClosed || videoReverseSocket !== socket) return
+            }
+            val state = videoEventState(urlVideoRequested, onPlaybackInfo())
+            val now = System.nanoTime()
+            if (state != null && (state != previous || now - lastEventNanos >= 5_000_000_000L)) {
+                socket.getOutputStream().apply { write(videoEventWire(sessionId, state)); flush() }
+                val ack = reader.read(socket.getInputStream()) ?: return
+                if (ack.method != "HTTP/1.1" || ack.uri != "200") return
+                previous = state
+                lastEventNanos = now
+            }
+            Thread.sleep(100)
+        }
+    }
+
+    /** Caller holds clientLock; closing a companion never tears down its parent media session. */
+    private fun closeVideoCompanions() {
+        videoCompanions.forEach { runCatching { it.close() } }
+        videoCompanions.clear()
+        videoReverseSocket = null
+        videoCompanionSessionId = null
+        urlVideoRequested = false
+    }
+
     private fun handleClient(socket: Socket) {
         socket.soTimeout = HANDSHAKE_IDLE_TIMEOUT_MS
         val inputStream = socket.getInputStream()
@@ -384,7 +525,7 @@ open class RtspHandler(
                     if (activeClient === socket) activeClientLastRequestNanos = System.nanoTime()
                 }
                 currentCSeq = request.headers["CSeq"]?.toIntOrNull() ?: 0
-                val response = routeRequest(request)
+                val response = synchronized(mediaControlLock) { routeRequest(request) }
                 sendResponse(outputStream, response)
                 // Poll established sockets so abandoned Wi-Fi sessions are reclaimed, while the
                 // media-activity signal below keeps a healthy quiet control channel alive.
@@ -427,24 +568,27 @@ open class RtspHandler(
         } finally {
             Logger.i("Client disconnected")
             socket.close()
-            val owned = synchronized(clientLock) {
-                if (activeClient === socket) {
-                    activeClient = null
-                    activeClientJob = null
-                    activeClientEstablished = false
-                    activeClientLastRequestNanos = 0L
-                    true
-                } else false
-            }
-            if (owned) {
-                currentSession = null
-                currentRemoteAddress = null
-                pairingSession = null
-                fairPlay = null
-                isMirrorSession = false
-                activeStreamTypes.clear()
-                setupCount = 0
-                if (established) onStreamingStopped()
+            synchronized(mediaControlLock) {
+                val owned = synchronized(clientLock) {
+                    if (activeClient === socket) {
+                        closeVideoCompanions()
+                        activeClient = null
+                        activeClientJob = null
+                        activeClientEstablished = false
+                        activeClientLastRequestNanos = 0L
+                        true
+                    } else false
+                }
+                if (owned) {
+                    currentSession = null
+                    currentRemoteAddress = null
+                    pairingSession = null
+                    fairPlay = null
+                    isMirrorSession = false
+                    activeStreamTypes.clear()
+                    setupCount = 0
+                    if (established) onStreamingStopped()
+                }
             }
         }
     }
@@ -540,6 +684,7 @@ open class RtspHandler(
             return RtspResponse(400, "Bad Request", protocol = request.responseProtocol())
         }
         Logger.i("POST /play url=$url start=$start")
+        urlVideoRequested = true
         onVideoPlay(url, start)
         return RtspResponse(200, "OK", protocol = request.responseProtocol())
     }
@@ -809,8 +954,10 @@ open class RtspHandler(
     }
 
     /** POST /fp-setup — FairPlay: 16-byte phase 1 → 142-byte reply; 164-byte phase 2 → 32-byte reply. */
-    private fun handleFpSetup(request: RtspRequest): RtspResponse = try {
-        val fp = fairPlay!!
+    private fun handleFpSetup(request: RtspRequest): RtspResponse = fairPlay?.let { handleFpSetup(request, it) }
+        ?: RtspResponse(400, "Bad Request", protocol = request.responseProtocol())
+
+    private fun handleFpSetup(request: RtspRequest, fp: FairPlay): RtspResponse = try {
         val b = request.bodyBytes
         // Diagnostics: byte 4 is the FairPlay version (0x03 mirroring/Safari, 0x02 Apple Music audio);
         // for phase 1, byte 14 is the mode (0..3). Confirms which path a given sender uses.
@@ -1193,29 +1340,8 @@ open class RtspHandler(
         )
     }
 
-    private fun sendResponse(outputStream: OutputStream, response: RtspResponse) {
-        // Binary-safe: build the header block as ASCII, then write the raw body bytes.
-        // Content-Length must be the BYTE length (not String.length) so binary plists,
-        // FairPlay payloads, and encrypted bodies are framed correctly.
-        val wire = response.wireBody()
-        val head = StringBuilder()
-        head.append("${response.protocol} ${response.statusCode} ${response.statusMessage}\r\n")
-        if (response.protocol.startsWith("RTSP")) {
-            head.append("CSeq: $currentCSeq\r\n")
-        }
-        head.append("Server: AirTunes/220.68\r\n")
-        response.contentType?.let { head.append("Content-Type: $it\r\n") }
-        response.headers.forEach { (key, value) ->
-            head.append("$key: $value\r\n")
-        }
-        if (wire.isNotEmpty()) {
-            head.append("Content-Length: ${wire.size}\r\n")
-        }
-        head.append("\r\n")
-        outputStream.write(head.toString().toByteArray(Charsets.US_ASCII))
-        if (wire.isNotEmpty()) {
-            outputStream.write(wire)
-        }
+    private fun sendResponse(outputStream: OutputStream, response: RtspResponse, cseq: Int = currentCSeq) {
+        outputStream.write(encodeControlResponse(response, cseq))
         outputStream.flush()
     }
 

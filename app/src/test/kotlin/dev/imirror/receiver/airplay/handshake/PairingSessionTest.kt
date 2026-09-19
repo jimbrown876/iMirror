@@ -140,6 +140,30 @@ class PairingSessionTest {
         assertFalse(server.isVerified)
     }
 
+    @Test
+    fun `companion identity requires a verified incumbent and fresh signature`() {
+        val owner = Ed25519PrivateKeyParameters(seed(9), 0)
+        val ownerKey = owner.generatePublicKey().encoded
+        val stranger = Ed25519PrivateKeyParameters(seed(20), 0)
+        val incumbent = PairingSession(PairingKeys.create(seed(7)))
+        val m2 = prepareClientM2(incumbent, owner)
+        assertFalse(incumbent.isVerifiedController(ownerKey))
+        incumbent.pairVerify(m2)
+        assertTrue(incumbent.isVerifiedController(ownerKey))
+        assertFalse(incumbent.isVerifiedController(stranger.generatePublicKey().encoded))
+
+        val companion = PairingSession(PairingKeys.create(seed(7)), incumbent::isVerifiedController)
+        val forged = prepareClientM2(companion, stranger, ownerKey)
+        assertThrows(SecurityException::class.java) { companion.pairVerify(forged) }
+        assertFalse(companion.isVerified)
+        companion.pairVerify(prepareClientM2(companion, owner))
+        assertTrue(companion.isVerified)
+        assertTrue(incumbent.isVerified)
+
+        prepareClientM2(incumbent, owner)
+        assertFalse(incumbent.isVerifiedController(ownerKey))
+    }
+
     /** Simulates the sender; advertised key may intentionally differ to test key impersonation. */
     private fun prepareClientM2(
         server: PairingSession,
