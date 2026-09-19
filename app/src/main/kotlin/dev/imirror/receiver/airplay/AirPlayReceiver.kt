@@ -319,11 +319,19 @@ class AirPlayReceiver(
 
         val generation = synchronized(legacyStartupLock) {
             legacyStartupJob?.cancel()
-            ++legacyStartupGeneration
+            legacyStartupJob = null
+            val nextGeneration = ++legacyStartupGeneration
+            // RECORD is acknowledged as soon as this callback returns. Prepare the audio
+            // player and bind its UDP socket on this RTSP worker first: queueing that work
+            // behind Main lets the sender hit an unopened port and abort on ICMP unreachable.
+            // Propagate startup failures so the caller cannot send a false success response.
+            if (session.hasAudio) startAudioPlayer(session)
+            nextGeneration
         }
         val startup = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                // Take over first: a background receiver has no Activity/Surface until CONNECTED.
+                // Request takeover before waiting for video: a background receiver has no
+                // Activity/Surface until CONNECTED. Audio transport is already ready above.
                 // Awaiting this dispatch (rather than scheduling another child) preserves order.
                 withContext(Dispatchers.Main) {
                     if (generation != legacyStartupGeneration) return@withContext
@@ -334,11 +342,6 @@ class AirPlayReceiver(
                     emitNowPlaying()
                     onSenderNameChanged(session.senderName)
                     if (generation == legacyStartupGeneration) emitState(ProtocolState.CONNECTED)
-                }
-                synchronized(legacyStartupLock) {
-                    if (generation != legacyStartupGeneration) return@launch
-                    // Audio-only playback never waits for a video output.
-                    if (session.hasAudio) startAudioPlayer(session)
                 }
                 if (session.hasVideo) {
                     val surface = awaitValidOutput(

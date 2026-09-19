@@ -6,6 +6,11 @@ It is not an Apple-certified receiver. No DRM bypass or paid service is included
 
 ## Candidate personal build: 1.0.9-personal (version code 10)
 
+- Legacy music startup prepares its audio player and binds the UDP port before returning from
+  the RECORD callback. Previously that preparation was queued behind main-thread UI work, so
+  a successful response could precede a usable audio endpoint. Two regression tests reproduce
+  the premature return and hidden initialization failure; physical Mac playback retesting is
+  still required. This does not resolve the separate legacy FairPlay v2 decoding limitation.
 - **Work in progress: Mac clear-URL video now renders on Bedroom; full regression is incomplete.**
   Native Safari reproduced additional
   same-controller RTSP pair-verification sockets followed by HTTP video commands. The previous
